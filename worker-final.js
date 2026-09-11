@@ -1,0 +1,918 @@
+// @ts-nocheck
+
+/**
+ * FIS Itobe Portal — Cloudflare D1 Worker (single-file build)
+ * Combines auth, student login, attendance, and assignments into one file
+ * to work around the mobile editor's limited multi-file support.
+ *
+ * Bindings expected (Settings -> Bindings):
+ *   DB         -> D1 database binding, pointed at fis-portal-db
+ *   JWT_SECRET -> Secret, any long random string
+ */
+
+// =====================================================================
+// SECTION 1: Password hashing (PBKDF2 via Web Crypto)
+// =====================================================================
+/**
+ * Password hashing using PBKDF2 via Web Crypto — no npm deps needed,
+ * works natively in the Cloudflare Workers runtime.
+ *
+ * Stored format: "pbkdf2$<iterations>$<saltBase64>$<hashBase64>"
+ */
+
+const ITERATIONS = 100000;
+const HASH_ALGO = "SHA-256";
+const KEY_LENGTH = 32; // bytes
+
+function toBase64(buffer) {
+  return btoa(String.fromCharCode(...new Uint8Array(buffer)));
+}
+
+function fromBase64(b64) {
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes.buffer;
+}
+
+async function deriveKey(password, salt, iterations) {
+  const enc = new TextEncoder();
+  const keyMaterial = await crypto.subtle.importKey(
+    "raw",
+    enc.encode(password),
+    "PBKDF2",
+    false,
+    ["deriveBits"]
+  );
+  const derivedBits = await crypto.subtle.deriveBits(
+    {
+      name: "PBKDF2",
+      salt,
+      iterations,
+      hash: HASH_ALGO
+    },
+    keyMaterial,
+    KEY_LENGTH * 8
+  );
+  return derivedBits;
+}
+
+/**
+ * Hash a plaintext password. Returns a self-describing string safe to
+ * store in the `password_hash` column.
+ */
+async function hash(password) {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const derivedBits = await deriveKey(password, salt, ITERATIONS);
+  return `pbkdf2$${ITERATIONS}$${toBase64(salt)}$${toBase64(derivedBits)}`;
+}
+
+/**
+ * Verify a plaintext password against a stored hash string.
+ * Uses constant-time comparison to avoid timing attacks.
+ */
+async function verify(password, storedHash) {
+  const parts = (storedHash || "").split("$");
+  if (parts.length !== 4 || parts[0] !== "pbkdf2") return false;
+
+  const iterations = parseInt(parts[1], 10);
+  const salt = fromBase64(parts[2]);
+  const expectedHash = fromBase64(parts[3]);
+
+  const derivedBits = await deriveKey(password, salt, iterations);
+  const derivedBytes = new Uint8Array(derivedBits);
+  const expectedBytes = new Uint8Array(expectedHash);
+
+  if (derivedBytes.length !== expectedBytes.length) return false;
+
+  // Constant-time comparison
+  let diff = 0;
+  for (let i = 0; i < derivedBytes.length; i++) {
+    diff |= derivedBytes[i] ^ expectedBytes[i];
+  }
+  return diff === 0;
+}
+
+// =====================================================================
+// SECTION 2: JWT (HMAC-signed session tokens via Web Crypto)
+// =====================================================================
+/**
+ * Minimal HMAC-signed JWT (HS256) using Web Crypto — no npm deps needed.
+ * Good enough for internal session tokens between portal.html and the Worker.
+ *
+ * Token shape: header.payload.signature (all base64url)
+ */
+
+const DEFAULT_EXPIRY_SECONDS = 60 * 60 * 12; // 12 hours
+
+function base64urlEncode(bufferOrString) {
+  let bytes;
+  if (typeof bufferOrString === "string") {
+    bytes = new TextEncoder().encode(bufferOrString);
+  } else {
+    bytes = new Uint8Array(bufferOrString);
+  }
+  let binary = "";
+  for (const b of bytes) binary += String.fromCharCode(b);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function base64urlDecodeToString(str) {
+  const padded = str.replace(/-/g, "+").replace(/_/g, "/");
+  const pad = padded.length % 4 === 0 ? "" : "=".repeat(4 - (padded.length % 4));
+  return atob(padded + pad);
+}
+
+async function getKey(secret) {
+  return crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign", "verify"]
+  );
+}
+
+/**
+ * Sign a payload into a JWT. `payload` should include `sub` (user id)
+ * at minimum; `exp` is added automatically if not provided.
+ */
+async function signToken(payload, secret, expiresInSeconds = DEFAULT_EXPIRY_SECONDS) {
+  const header = { alg: "HS256", typ: "JWT" };
+  const now = Math.floor(Date.now() / 1000);
+  const fullPayload = {
+    iat: now,
+    exp: now + expiresInSeconds,
+    ...payload
+  };
+
+  const encodedHeader = base64urlEncode(JSON.stringify(header));
+  const encodedPayload = base64urlEncode(JSON.stringify(fullPayload));
+  const signingInput = `${encodedHeader}.${encodedPayload}`;
+
+  const key = await getKey(secret);
+  const signatureBuffer = await crypto.subtle.sign(
+    "HMAC",
+    key,
+    new TextEncoder().encode(signingInput)
+  );
+  const encodedSignature = base64urlEncode(signatureBuffer);
+
+  return `${signingInput}.${encodedSignature}`;
+}
+
+/**
+ * Verify a JWT's signature and expiry. Throws if invalid or expired.
+ * Returns the decoded payload on success.
+ */
+async function verifyToken(token, secret) {
+  const parts = token.split(".");
+  if (parts.length !== 3) throw new Error("Malformed token.");
+  const [encodedHeader, encodedPayload, encodedSignature] = parts;
+
+  const key = await getKey(secret);
+  const signingInput = `${encodedHeader}.${encodedPayload}`;
+
+  const signatureBytes = Uint8Array.from(
+    base64urlDecodeToString(encodedSignature),
+    c => c.charCodeAt(0)
+  );
+
+  const valid = await crypto.subtle.verify(
+    "HMAC",
+    key,
+    signatureBytes,
+    new TextEncoder().encode(signingInput)
+  );
+  if (!valid) throw new Error("Invalid signature.");
+
+  const payload = JSON.parse(base64urlDecodeToString(encodedPayload));
+  const now = Math.floor(Date.now() / 1000);
+  if (payload.exp && payload.exp < now) throw new Error("Token expired.");
+
+  return payload;
+}
+
+// =====================================================================
+// SECTION 3: Shared session helper (staff + student)
+// =====================================================================
+/**
+ * Shared session helper — used by every Worker route file.
+ * Two kinds of session token, distinguished by payload.type:
+ *   'staff'   -> sub = users.id      (password login)
+ *   'student' -> sub = students.id   (admission no + PIN login)
+ */
+
+
+async function getSession(request, env) {
+  const authHeader = request.headers.get("Authorization") || "";
+  const token = authHeader.replace("Bearer ", "");
+  if (!token) return null;
+
+  let payload;
+  try {
+    payload = await verifyToken(token, env.JWT_SECRET);
+  } catch {
+    return null;
+  }
+
+  if (payload.type === "staff") {
+    const user = await env.DB
+      .prepare("SELECT * FROM users WHERE id = ? AND status = 'active'")
+      .bind(payload.sub)
+      .first();
+    if (!user) return null;
+    return { type: "staff", id: user.id, role: user.role, level: user.level, record: user };
+  }
+
+  if (payload.type === "student") {
+    const student = await env.DB
+      .prepare("SELECT * FROM students WHERE id = ? AND status = 'active'")
+      .bind(payload.sub)
+      .first();
+    if (!student) return null;
+    return { type: "student", id: student.id, record: student };
+  }
+
+  return null;
+}
+
+function isStaff(session) {
+  return !!session && session.type === "staff";
+}
+
+function isAdminSession(session) {
+  return isStaff(session) && ["general_admin", "primary_admin", "secondary_admin"].includes(session.role);
+}
+
+function isTeachingStaff(session) {
+  return isStaff(session) && ["general_admin", "primary_admin", "secondary_admin", "teacher"].includes(session.role);
+}
+
+function isOwnStudent(session, studentId) {
+  return !!session && session.type === "student" && session.id === studentId;
+}
+
+// =====================================================================
+// SECTION 4: Auth & account approval routes
+// =====================================================================
+
+// =====================================================================
+// SECTION 5: Student login routes (admission no + PIN)
+// =====================================================================
+
+// =====================================================================
+// SECTION 6: Attendance routes
+// =====================================================================
+
+// =====================================================================
+// SECTION 7: Assignment routes
+// =====================================================================
+/**
+ * FIS Itobe Portal — Worker route module (Auth & Account Approval)
+ * Exported as a route handler, combined with other modules in index.js.
+ *
+ * Routes:
+ *   POST /api/signup            { name, email, password, requestedRole, requestedLevel }
+ *   POST /api/login             { email, password }
+ *   GET  /api/approvals         (auth: admin) list pending users
+ *   POST /api/approvals/:id     (auth: admin) { action: 'approve'|'reject', role, level }
+ *   GET  /api/me                (auth: any staff) return current user profile
+ */
+
+
+function json(data, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { "Content-Type": "application/json" }
+  });
+}
+
+function uuid() {
+  return crypto.randomUUID();
+}
+
+/**
+ * Returns a Response if this module handles the request, or null to let
+ * the router try the next module.
+ */
+async function handleAuthRoutes(request, env, url) {
+  const { pathname } = url;
+
+  // ---------------- SIGNUP ----------------
+  if (pathname === "/api/signup" && request.method === "POST") {
+    const { name, email, password, requestedRole, requestedLevel } = await request.json();
+
+    if (!name || !email || !password) {
+      return json({ error: "Missing required fields." }, 400);
+    }
+    if (password.length < 8) {
+      return json({ error: "Password must be at least 8 characters." }, 400);
+    }
+
+    const existing = await env.DB
+      .prepare("SELECT id FROM users WHERE email = ?")
+      .bind(email.toLowerCase())
+      .first();
+    if (existing) {
+      return json({ error: "That email is already registered." }, 409);
+    }
+
+    const passwordHash = await hash(password);
+    const id = uuid();
+
+    await env.DB
+      .prepare(
+        `INSERT INTO users (id, name, email, password_hash, role, status, requested_role, requested_level, self_registered)
+         VALUES (?, ?, ?, ?, 'pending', 'pending', ?, ?, 1)`
+      )
+      .bind(id, name, email.toLowerCase(), passwordHash, requestedRole, requestedLevel)
+      .run();
+
+    return json({
+      message: "Account request submitted. An administrator must approve it before you can sign in."
+    });
+  }
+
+  // ---------------- LOGIN ----------------
+  if (pathname === "/api/login" && request.method === "POST") {
+    const { email, password } = await request.json();
+    const user = await env.DB
+      .prepare("SELECT * FROM users WHERE email = ?")
+      .bind((email || "").toLowerCase())
+      .first();
+
+    if (!user) return json({ error: "Invalid email or password." }, 401);
+
+    const valid = await verify(password, user.password_hash);
+    if (!valid) return json({ error: "Invalid email or password." }, 401);
+
+    if (user.status === "pending") {
+      return json({ error: "Your account is awaiting administrator approval." }, 403);
+    }
+    if (user.status === "rejected") {
+      return json({ error: "This account request was not approved. Please contact the school administrator." }, 403);
+    }
+    if (user.status === "suspended") {
+      return json({ error: "This account has been suspended. Please contact the school administrator." }, 403);
+    }
+
+    const token = await signToken({ sub: user.id, type: "staff", role: user.role }, env.JWT_SECRET);
+    return json({
+      token,
+      user: { id: user.id, name: user.name, role: user.role, level: user.level }
+    });
+  }
+
+  // ---------------- ME ----------------
+  if (pathname === "/api/me" && request.method === "GET") {
+    const sessionCtx = await getSession(request, env);
+    if (!sessionCtx || sessionCtx.type !== "staff") return json({ error: "Not authenticated." }, 401);
+    const u = sessionCtx.record;
+    return json({ id: u.id, name: u.name, email: u.email, role: u.role, level: u.level });
+  }
+
+  // ---------------- LIST PENDING APPROVALS ----------------
+  if (pathname === "/api/approvals" && request.method === "GET") {
+    const sessionCtx = await getSession(request, env);
+    if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const level = url.searchParams.get("level");
+    const stmt = level
+      ? env.DB.prepare("SELECT id, name, email, requested_role, requested_level, created_at FROM users WHERE status = 'pending' AND requested_level = ?").bind(level)
+      : env.DB.prepare("SELECT id, name, email, requested_role, requested_level, created_at FROM users WHERE status = 'pending'");
+
+    const { results } = await stmt.all();
+    return json({ requests: results });
+  }
+
+  // ---------------- APPROVE / REJECT ----------------
+  const approvalMatch = pathname.match(/^\/api\/approvals\/([^/]+)$/);
+  if (approvalMatch && request.method === "POST") {
+    const sessionCtx = await getSession(request, env);
+    if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const userId = approvalMatch[1];
+    const { action, role, level } = await request.json();
+
+    const target = await env.DB
+      .prepare("SELECT * FROM users WHERE id = ? AND status = 'pending'")
+      .bind(userId)
+      .first();
+    if (!target) return json({ error: "Request not found or already handled." }, 404);
+
+    if (action === "approve") {
+      if (!role) return json({ error: "Approved role is required." }, 400);
+      await env.DB
+        .prepare(
+          `UPDATE users SET status = 'active', role = ?, level = ?, approved_by = ?, approved_at = datetime('now')
+           WHERE id = ?`
+        )
+        .bind(role, level || target.requested_level, sessionCtx.id, userId)
+        .run();
+      return json({ message: "Account approved." });
+    }
+
+    if (action === "reject") {
+      await env.DB
+        .prepare(
+          `UPDATE users SET status = 'rejected', approved_by = ?, approved_at = datetime('now') WHERE id = ?`
+        )
+        .bind(sessionCtx.id, userId)
+        .run();
+      return json({ message: "Account rejected." });
+    }
+
+    return json({ error: "Invalid action." }, 400);
+  }
+
+  return null; // not handled here — let the router try the next module
+}
+/**
+ * FIS Itobe Portal — Worker API (Student Login)
+ * Students authenticate with Admission Number + PIN (no email/password account),
+ * matching the existing Firebase-era model. On success, issues a JWT scoped to
+ * that student only (type: 'student'), usable against student-facing endpoints
+ * like /api/attendance/student/:studentId, /api/assignments, /api/notes.
+ *
+ * Routes:
+ *   POST /api/student-login   { admissionNo, pin, term, session }
+ *   GET  /api/student-me      (auth: student) return own profile
+ */
+
+
+
+
+async function handleStudentAuthRoutes(request, env, url) {
+    const { pathname } = url;
+
+    // ---------------- STUDENT LOGIN ----------------
+    if (pathname === "/api/student-login" && request.method === "POST") {
+      const { admissionNo, pin, term, session } = await request.json();
+      if (!admissionNo || !pin || !term || !session) {
+        return json({ error: "Admission number, PIN, term, and session are required." }, 400);
+      }
+
+      const student = await env.DB
+        .prepare("SELECT * FROM students WHERE admission_no = ? AND status = 'active'")
+        .bind(admissionNo.trim())
+        .first();
+      if (!student) {
+        return json({ error: "Admission number not found." }, 404);
+      }
+
+      const pinRow = await env.DB
+        .prepare(
+          `SELECT * FROM student_pins WHERE student_id = ? AND term = ? AND session = ?`
+        )
+        .bind(student.id, term, session)
+        .first();
+      if (!pinRow) {
+        return json({ error: "No PIN has been generated for this term/session yet." }, 404);
+      }
+
+      const valid = await verify(pin, pinRow.pin_hash);
+      if (!valid) {
+        return json({ error: "Incorrect PIN." }, 401);
+      }
+
+      const token = await signToken(
+        { sub: student.id, type: "student" },
+        env.JWT_SECRET,
+        60 * 60 * 6 // 6-hour session — shorter-lived than staff, re-enter PIN next visit
+      );
+
+      return json({
+        token,
+        student: {
+          id: student.id,
+          name: student.name,
+          admissionNo: student.admission_no,
+          classId: student.class_id,
+          level: student.level
+        }
+      });
+    }
+
+    // ---------------- STUDENT SELF PROFILE ----------------
+    if (pathname === "/api/student-me" && request.method === "GET") {
+      const sessionCtx = await getSession(request, env);
+      if (!sessionCtx || sessionCtx.type !== "student") {
+        return json({ error: "Not authenticated." }, 401);
+      }
+      const s = sessionCtx.record;
+      return json({
+        id: s.id, name: s.name, admissionNo: s.admission_no,
+        classId: s.class_id, level: s.level
+      });
+    }
+
+    return null; // not handled here — let the router try the next module
+}
+/**
+ * FIS Itobe Portal — Worker API (Attendance)
+ * Bindings expected:
+ *   DB -> D1 database binding (fis-portal-db)
+ *
+ * Routes:
+ *   POST /api/attendance              (auth: teacher/admin) mark attendance for a class/date
+ *        body: { classId, date, term, session, records: [{ studentId, status }] }
+ *   GET  /api/attendance?classId=&date=          (auth: teacher/admin) view one day for a class
+ *   GET  /api/attendance/student/:studentId?term=&session=   (auth: any logged-in; student sees own)
+ *   GET  /api/attendance/summary?classId=&term=&session=     (auth: teacher/admin) per-student totals
+ */
+
+
+
+
+
+
+const VALID_STATUSES = ["present", "absent", "late", "excused"];
+
+async function handleAttendanceRoutes(request, env, url) {
+    const { pathname } = url;
+
+    // ---------------- MARK ATTENDANCE (bulk, one class/date) ----------------
+    if (pathname === "/api/attendance" && request.method === "POST") {
+      const sessionCtx = await getSession(request, env);
+      if (!isTeachingStaff(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+      const { classId, date, term, session, records } = await request.json();
+      if (!classId || !date || !term || !session || !Array.isArray(records) || !records.length) {
+        return json({ error: "classId, date, term, session, and records[] are required." }, 400);
+      }
+      for (const r of records) {
+        if (!r.studentId || !VALID_STATUSES.includes(r.status)) {
+          return json({ error: `Invalid record: ${JSON.stringify(r)}` }, 400);
+        }
+      }
+
+      // Upsert each record — one row per student per date (see UNIQUE constraint)
+      const statements = records.map(r =>
+        env.DB.prepare(
+          `INSERT INTO attendance (id, student_id, class_id, date, status, term, session, marked_by)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(student_id, date) DO UPDATE SET
+             status = excluded.status,
+             marked_by = excluded.marked_by,
+             marked_at = datetime('now')`
+        ).bind(uuid(), r.studentId, classId, date, r.status, term, session, sessionCtx.id)
+      );
+
+      await env.DB.batch(statements);
+      return json({ message: `Attendance saved for ${records.length} student(s).` });
+    }
+
+    // ---------------- VIEW ONE DAY FOR A CLASS ----------------
+    if (pathname === "/api/attendance" && request.method === "GET") {
+      const sessionCtx = await getSession(request, env);
+      if (!isTeachingStaff(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+      const classId = url.searchParams.get("classId");
+      const date = url.searchParams.get("date");
+      if (!classId || !date) return json({ error: "classId and date are required." }, 400);
+
+      const { results } = await env.DB
+        .prepare(
+          `SELECT a.student_id, s.name AS student_name, a.status
+           FROM students s
+           LEFT JOIN attendance a ON a.student_id = s.id AND a.date = ?
+           WHERE s.class_id = ? AND s.status = 'active'
+           ORDER BY s.name`
+        )
+        .bind(date, classId)
+        .all();
+
+      return json({ classId, date, students: results });
+    }
+
+    // ---------------- STUDENT'S OWN HISTORY ----------------
+    const studentMatch = pathname.match(/^\/api\/attendance\/student\/([^/]+)$/);
+    if (studentMatch && request.method === "GET") {
+      const sessionCtx = await getSession(request, env);
+      if (!sessionCtx) return json({ error: "Not authenticated." }, 401);
+
+      const studentId = studentMatch[1];
+      // Staff can view any student; a student session can only view its own record.
+      if (!isTeachingStaff(sessionCtx) && !isOwnStudent(sessionCtx, studentId)) {
+        return json({ error: "Not authorised." }, 403);
+      }
+
+      const term = url.searchParams.get("term");
+      const session = url.searchParams.get("session");
+      if (!term || !session) return json({ error: "term and session are required." }, 400);
+
+      const { results } = await env.DB
+        .prepare(
+          `SELECT date, status FROM attendance
+           WHERE student_id = ? AND term = ? AND session = ?
+           ORDER BY date`
+        )
+        .bind(studentId, term, session)
+        .all();
+
+      const totals = results.reduce((acc, r) => {
+        acc[r.status] = (acc[r.status] || 0) + 1;
+        return acc;
+      }, {});
+
+      return json({ studentId, term, session, days: results, totals });
+    }
+
+    // ---------------- CLASS SUMMARY (per-student totals for a term) ----------------
+    if (pathname === "/api/attendance/summary" && request.method === "GET") {
+      const sessionCtx = await getSession(request, env);
+      if (!isTeachingStaff(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+      const classId = url.searchParams.get("classId");
+      const term = url.searchParams.get("term");
+      const session = url.searchParams.get("session");
+      if (!classId || !term || !session) {
+        return json({ error: "classId, term, and session are required." }, 400);
+      }
+
+      const { results } = await env.DB
+        .prepare(
+          `SELECT s.id AS student_id, s.name,
+                  SUM(CASE WHEN a.status = 'present' THEN 1 ELSE 0 END) AS present_count,
+                  SUM(CASE WHEN a.status = 'absent'  THEN 1 ELSE 0 END) AS absent_count,
+                  SUM(CASE WHEN a.status = 'late'    THEN 1 ELSE 0 END) AS late_count,
+                  SUM(CASE WHEN a.status = 'excused' THEN 1 ELSE 0 END) AS excused_count,
+                  COUNT(a.id) AS total_marked
+           FROM students s
+           LEFT JOIN attendance a ON a.student_id = s.id AND a.term = ? AND a.session = ?
+           WHERE s.class_id = ? AND s.status = 'active'
+           GROUP BY s.id, s.name
+           ORDER BY s.name`
+        )
+        .bind(term, session, classId)
+        .all();
+
+      return json({ classId, term, session, summary: results });
+    }
+
+    return null; // not handled here — let the router try the next module
+}
+/**
+ * FIS Itobe Portal — Worker route module (Assignments)
+ *
+ * Routes:
+ *   POST /api/assignments                         (auth: teaching staff) create an assignment
+ *        body: { title, description, classId, subjectId, dueDate, term, session }
+ *   GET  /api/assignments?classId=&term=&session=  (auth: staff, or student — student sees own class only)
+ *   GET  /api/assignments/:id                      (auth: any logged-in)
+ *   POST /api/assignments/:id/submit               (auth: student) mark own submission as submitted
+ *   GET  /api/assignments/:id/submissions          (auth: teaching staff) per-student submission status
+ *   PATCH /api/assignments/:id/submissions/:studentId  (auth: teaching staff) set remark/grade status
+ */
+
+
+
+
+
+
+const SUBMISSION_STATUSES = ["not_submitted", "submitted", "late", "graded"];
+
+async function handleAssignmentRoutes(request, env, url) {
+  const { pathname } = url;
+
+  // ---------------- CREATE ASSIGNMENT ----------------
+  if (pathname === "/api/assignments" && request.method === "POST") {
+    const sessionCtx = await getSession(request, env);
+    if (!isTeachingStaff(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const { title, description, classId, subjectId, dueDate, term, session } = await request.json();
+    if (!title || !classId || !subjectId || !dueDate || !term || !session) {
+      return json({ error: "title, classId, subjectId, dueDate, term, and session are required." }, 400);
+    }
+
+    const id = uuid();
+    await env.DB
+      .prepare(
+        `INSERT INTO assignments (id, title, description, class_id, subject_id, due_date, term, session, created_by)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .bind(id, title, description || "", classId, subjectId, dueDate, term, session, sessionCtx.id)
+      .run();
+
+    return json({ id, message: "Assignment created." });
+  }
+
+  // ---------------- LIST ASSIGNMENTS FOR A CLASS ----------------
+  if (pathname === "/api/assignments" && request.method === "GET") {
+    const sessionCtx = await getSession(request, env);
+    if (!sessionCtx) return json({ error: "Not authenticated." }, 401);
+
+    const term = url.searchParams.get("term");
+    const session = url.searchParams.get("session");
+    let classId = url.searchParams.get("classId");
+
+    if (!term || !session) return json({ error: "term and session are required." }, 400);
+
+    if (sessionCtx.type === "student") {
+      // Students can only ever see their own class's assignments,
+      // regardless of what classId (if any) they pass.
+      classId = sessionCtx.record.class_id;
+    } else if (!classId) {
+      return json({ error: "classId is required for staff requests." }, 400);
+    }
+
+    const { results } = await env.DB
+      .prepare(
+        `SELECT id, title, description, due_date, subject_id, term, session, created_at
+         FROM assignments
+         WHERE class_id = ? AND term = ? AND session = ?
+         ORDER BY due_date`
+      )
+      .bind(classId, term, session)
+      .all();
+
+    return json({ classId, term, session, assignments: results });
+  }
+
+  // ---------------- ASSIGNMENT DETAIL ----------------
+  const detailMatch = pathname.match(/^\/api\/assignments\/([^/]+)$/);
+  if (detailMatch && request.method === "GET") {
+    const sessionCtx = await getSession(request, env);
+    if (!sessionCtx) return json({ error: "Not authenticated." }, 401);
+
+    const assignment = await env.DB
+      .prepare("SELECT * FROM assignments WHERE id = ?")
+      .bind(detailMatch[1])
+      .first();
+    if (!assignment) return json({ error: "Assignment not found." }, 404);
+
+    if (sessionCtx.type === "student" && sessionCtx.record.class_id !== assignment.class_id) {
+      return json({ error: "Not authorised." }, 403);
+    }
+
+    return json({ assignment });
+  }
+
+  // ---------------- STUDENT SUBMITS ----------------
+  const submitMatch = pathname.match(/^\/api\/assignments\/([^/]+)\/submit$/);
+  if (submitMatch && request.method === "POST") {
+    const sessionCtx = await getSession(request, env);
+    if (!sessionCtx || sessionCtx.type !== "student") {
+      return json({ error: "Only students can submit assignments." }, 403);
+    }
+
+    const assignmentId = submitMatch[1];
+    const assignment = await env.DB
+      .prepare("SELECT * FROM assignments WHERE id = ?")
+      .bind(assignmentId)
+      .first();
+    if (!assignment) return json({ error: "Assignment not found." }, 404);
+    if (assignment.class_id !== sessionCtx.record.class_id) {
+      return json({ error: "This assignment is not for your class." }, 403);
+    }
+
+    const now = new Date();
+    const due = new Date(assignment.due_date);
+    const status = now > due ? "late" : "submitted";
+
+    const existing = await env.DB
+      .prepare("SELECT id FROM assignment_submissions WHERE assignment_id = ? AND student_id = ?")
+      .bind(assignmentId, sessionCtx.id)
+      .first();
+
+    if (existing) {
+      await env.DB
+        .prepare(
+          `UPDATE assignment_submissions SET status = ?, submitted_at = datetime('now')
+           WHERE assignment_id = ? AND student_id = ?`
+        )
+        .bind(status, assignmentId, sessionCtx.id)
+        .run();
+    } else {
+      await env.DB
+        .prepare(
+          `INSERT INTO assignment_submissions (id, assignment_id, student_id, status, submitted_at)
+           VALUES (?, ?, ?, ?, datetime('now'))`
+        )
+        .bind(uuid(), assignmentId, sessionCtx.id, status)
+        .run();
+    }
+
+    return json({ message: status === "late" ? "Submitted late." : "Submitted." , status });
+  }
+
+  // ---------------- TEACHER VIEWS SUBMISSIONS FOR AN ASSIGNMENT ----------------
+  const submissionsMatch = pathname.match(/^\/api\/assignments\/([^/]+)\/submissions$/);
+  if (submissionsMatch && request.method === "GET") {
+    const sessionCtx = await getSession(request, env);
+    if (!isTeachingStaff(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const assignmentId = submissionsMatch[1];
+    const assignment = await env.DB
+      .prepare("SELECT * FROM assignments WHERE id = ?")
+      .bind(assignmentId)
+      .first();
+    if (!assignment) return json({ error: "Assignment not found." }, 404);
+
+    const { results } = await env.DB
+      .prepare(
+        `SELECT s.id AS student_id, s.name,
+                COALESCE(sub.status, 'not_submitted') AS status,
+                sub.submitted_at, sub.remark
+         FROM students s
+         LEFT JOIN assignment_submissions sub
+           ON sub.student_id = s.id AND sub.assignment_id = ?
+         WHERE s.class_id = ? AND s.status = 'active'
+         ORDER BY s.name`
+      )
+      .bind(assignmentId, assignment.class_id)
+      .all();
+
+    return json({ assignmentId, submissions: results });
+  }
+
+  // ---------------- TEACHER GRADES/REMARKS A SUBMISSION ----------------
+  const gradeMatch = pathname.match(/^\/api\/assignments\/([^/]+)\/submissions\/([^/]+)$/);
+  if (gradeMatch && request.method === "PATCH") {
+    const sessionCtx = await getSession(request, env);
+    if (!isTeachingStaff(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const [, assignmentId, studentId] = gradeMatch;
+    const { status, remark } = await request.json();
+    if (status && !SUBMISSION_STATUSES.includes(status)) {
+      return json({ error: "Invalid status." }, 400);
+    }
+
+    const existing = await env.DB
+      .prepare("SELECT id FROM assignment_submissions WHERE assignment_id = ? AND student_id = ?")
+      .bind(assignmentId, studentId)
+      .first();
+
+    if (existing) {
+      await env.DB
+        .prepare(
+          `UPDATE assignment_submissions SET status = COALESCE(?, status), remark = ?
+           WHERE assignment_id = ? AND student_id = ?`
+        )
+        .bind(status || null, remark || null, assignmentId, studentId)
+        .run();
+    } else {
+      await env.DB
+        .prepare(
+          `INSERT INTO assignment_submissions (id, assignment_id, student_id, status, remark)
+           VALUES (?, ?, ?, ?, ?)`
+        )
+        .bind(uuid(), assignmentId, studentId, status || "graded", remark || null)
+        .run();
+    }
+
+    return json({ message: "Submission updated." });
+  }
+
+  return null; // not handled here — let the router try the next module
+}
+
+// =====================================================================
+// SECTION 8: Entry point — routes across all sections above
+// =====================================================================
+const modules = [
+  handleAuthRoutes,
+  handleStudentAuthRoutes,
+  handleAttendanceRoutes,
+  handleAssignmentRoutes
+];
+
+function corsHeaders() {
+  return {
+    "Access-Control-Allow-Origin": "*", // tighten to your portal's domain before production
+    "Access-Control-Allow-Methods": "GET,POST,PATCH,OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type,Authorization"
+  };
+}
+
+export default {
+  async fetch(request, env) {
+    if (request.method === "OPTIONS") {
+      return new Response(null, { headers: corsHeaders() });
+    }
+
+    const url = new URL(request.url);
+
+    try {
+      for (const handler of modules) {
+        const response = await handler(request, env, url);
+        if (response) {
+          const merged = new Headers(response.headers);
+          for (const [k, v] of Object.entries(corsHeaders())) merged.set(k, v);
+          return new Response(response.body, { status: response.status, headers: merged });
+        }
+      }
+    } catch (err) {
+      return new Response(JSON.stringify({ error: "Internal error: " + err.message }), {
+        status: 500,
+        headers: { "Content-Type": "application/json", ...corsHeaders() }
+      });
+    }
+
+    return new Response(JSON.stringify({ error: "Not found." }), {
+      status: 404,
+      headers: { "Content-Type": "application/json", ...corsHeaders() }
+    });
+  }
+};
