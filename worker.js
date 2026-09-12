@@ -869,13 +869,111 @@ async function handleAssignmentRoutes(request, env, url) {
 }
 
 // =====================================================================
+// SECTION 7B: Roster routes (Classes & Students)
+// =====================================================================
+/**
+ * FIS Itobe Portal — Worker API (Roster: Classes & Students)
+ *
+ * Routes:
+ *   GET  /api/classes                  (auth: teaching staff) list all classes
+ *   POST /api/classes                  (auth: admin) create a class { name, level, sortOrder }
+ *   GET  /api/students?classId=        (auth: teaching staff) list active students in a class
+ *   POST /api/students                 (auth: admin) create a student
+ *        body: { admissionNo, name, classId, level, sessionJoined, guardianName, guardianPhone }
+ */
+
+async function handleRosterRoutes(request, env, url) {
+  const { pathname } = url;
+
+  // ---------------- LIST CLASSES ----------------
+  if (pathname === "/api/classes" && request.method === "GET") {
+    const sessionCtx = await getSession(request, env);
+    if (!isTeachingStaff(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const level = url.searchParams.get("level");
+    const stmt = level
+      ? env.DB.prepare("SELECT * FROM classes WHERE level = ? ORDER BY sort_order, name").bind(level)
+      : env.DB.prepare("SELECT * FROM classes ORDER BY level, sort_order, name");
+
+    const { results } = await stmt.all();
+    return json({ classes: results });
+  }
+
+  // ---------------- CREATE CLASS ----------------
+  if (pathname === "/api/classes" && request.method === "POST") {
+    const sessionCtx = await getSession(request, env);
+    if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const { name, level, sortOrder } = await request.json();
+    if (!name || !level) {
+      return json({ error: "name and level are required." }, 400);
+    }
+
+    const id = uuid();
+    await env.DB
+      .prepare(`INSERT INTO classes (id, name, level, sort_order) VALUES (?, ?, ?, ?)`)
+      .bind(id, name, level, sortOrder || 0)
+      .run();
+
+    return json({ message: "Class created.", id });
+  }
+
+  // ---------------- LIST STUDENTS ----------------
+  if (pathname === "/api/students" && request.method === "GET") {
+    const sessionCtx = await getSession(request, env);
+    if (!isTeachingStaff(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const classId = url.searchParams.get("classId");
+    const stmt = classId
+      ? env.DB.prepare("SELECT * FROM students WHERE class_id = ? AND status = 'active' ORDER BY name").bind(classId)
+      : env.DB.prepare("SELECT * FROM students WHERE status = 'active' ORDER BY name");
+
+    const { results } = await stmt.all();
+    return json({ students: results });
+  }
+
+  // ---------------- CREATE STUDENT ----------------
+  if (pathname === "/api/students" && request.method === "POST") {
+    const sessionCtx = await getSession(request, env);
+    if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const { admissionNo, name, classId, level, sessionJoined, guardianName, guardianPhone } = await request.json();
+    if (!admissionNo || !name || !classId || !level) {
+      return json({ error: "admissionNo, name, classId, and level are required." }, 400);
+    }
+
+    const existing = await env.DB
+      .prepare("SELECT id FROM students WHERE admission_no = ?")
+      .bind(admissionNo.trim())
+      .first();
+    if (existing) {
+      return json({ error: "That admission number is already in use." }, 409);
+    }
+
+    const id = uuid();
+    await env.DB
+      .prepare(
+        `INSERT INTO students (id, admission_no, name, class_id, level, session_joined, guardian_name, guardian_phone, status, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', datetime('now'))`
+      )
+      .bind(id, admissionNo.trim(), name, classId, level, sessionJoined || null, guardianName || null, guardianPhone || null)
+      .run();
+
+    return json({ message: "Student added.", id });
+  }
+
+  return null; // not handled here — let the router try the next module
+}
+
+// =====================================================================
 // SECTION 8: Entry point — routes across all sections above
 // =====================================================================
 const modules = [
   handleAuthRoutes,
   handleStudentAuthRoutes,
   handleAttendanceRoutes,
-  handleAssignmentRoutes
+  handleAssignmentRoutes,
+  handleRosterRoutes
 ];
 
 function corsHeaders() {
