@@ -889,6 +889,8 @@ async function handleAssignmentRoutes(request, env, url) {
  *   GET  /api/classes/:classId/subjects       (auth: teaching staff) list subjects assigned to a class
  *   POST /api/classes/:classId/subjects       (auth: admin) assign a subject { subjectId }
  *   DELETE /api/classes/:classId/subjects/:subjectId  (auth: admin) unassign a subject
+ *   GET  /api/classes/:classId/pin-status?term=&session=  (auth: admin) per-student
+ *        has-a-pin flag for that term/session, used to skip or flag already-assigned PINs
  */
 
 /**
@@ -1127,6 +1129,35 @@ async function handleRosterRoutes(request, env, url) {
       .run();
 
     return json({ message: "Subject removed from class." });
+  }
+
+  // ---------------- PIN STATUS FOR A CLASS (term/session) ----------------
+  const pinStatusMatch = pathname.match(/^\/api\/classes\/([^/]+)\/pin-status$/);
+  if (pinStatusMatch && request.method === "GET") {
+    const sessionCtx = await getSession(request, env);
+    if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const classId = pinStatusMatch[1];
+    const term = url.searchParams.get("term");
+    const session = url.searchParams.get("session");
+    if (!term || !session) {
+      return json({ error: "term and session are required." }, 400);
+    }
+
+    const { results } = await env.DB
+      .prepare(
+        `SELECT s.id, s.name, s.admission_no,
+                CASE WHEN sp.id IS NOT NULL THEN 1 ELSE 0 END AS has_pin
+         FROM students s
+         LEFT JOIN student_pins sp
+           ON sp.student_id = s.id AND sp.term = ? AND sp.session = ?
+         WHERE s.class_id = ? AND s.status = 'active'
+         ORDER BY s.name`
+      )
+      .bind(term, session, classId)
+      .all();
+
+    return json({ classId, term, session, students: results });
   }
 
   return null; // not handled here — let the router try the next module
