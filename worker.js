@@ -664,6 +664,8 @@ async function handleAttendanceRoutes(request, env, url) {
  *   POST /api/assignments/:id/submit               (auth: student) mark own submission as submitted
  *   GET  /api/assignments/:id/submissions          (auth: teaching staff) per-student submission status
  *   PATCH /api/assignments/:id/submissions/:studentId  (auth: teaching staff) set remark/grade status
+ *   DELETE /api/assignments/:id                    (auth: teaching staff) delete an assignment
+ *        and its submissions
  */
 
 
@@ -865,6 +867,30 @@ async function handleAssignmentRoutes(request, env, url) {
     return json({ message: "Submission updated." });
   }
 
+  // ---------------- DELETE ASSIGNMENT ----------------
+  if (detailMatch && request.method === "DELETE") {
+    const sessionCtx = await getSession(request, env);
+    if (!isTeachingStaff(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const assignmentId = detailMatch[1];
+    const assignment = await env.DB
+      .prepare("SELECT id FROM assignments WHERE id = ?")
+      .bind(assignmentId)
+      .first();
+    if (!assignment) return json({ error: "Assignment not found." }, 404);
+
+    await env.DB
+      .prepare("DELETE FROM assignment_submissions WHERE assignment_id = ?")
+      .bind(assignmentId)
+      .run();
+    await env.DB
+      .prepare("DELETE FROM assignments WHERE id = ?")
+      .bind(assignmentId)
+      .run();
+
+    return json({ message: "Assignment deleted." });
+  }
+
   return null; // not handled here — let the router try the next module
 }
 
@@ -891,6 +917,10 @@ async function handleAssignmentRoutes(request, env, url) {
  *   DELETE /api/classes/:classId/subjects/:subjectId  (auth: admin) unassign a subject
  *   GET  /api/classes/:classId/pin-status?term=&session=  (auth: admin) per-student
  *        has-a-pin flag for that term/session, used to skip or flag already-assigned PINs
+ *   DELETE /api/classes/:id           (auth: admin) delete a class (must have no active students)
+ *   DELETE /api/subjects/:id          (auth: admin) delete a subject
+ *   DELETE /api/students/:id          (auth: admin) soft-delete a student (sets status to inactive,
+ *        preserving their attendance/assignment/PIN history)
  */
 
 /**
@@ -1158,6 +1188,61 @@ async function handleRosterRoutes(request, env, url) {
       .all();
 
     return json({ classId, term, session, students: results });
+  }
+
+  // ---------------- DELETE CLASS ----------------
+  const classDetailMatch = pathname.match(/^\/api\/classes\/([^/]+)$/);
+  if (classDetailMatch && request.method === "DELETE") {
+    const sessionCtx = await getSession(request, env);
+    if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const classId = classDetailMatch[1];
+    const studentCount = await env.DB
+      .prepare("SELECT COUNT(*) AS count FROM students WHERE class_id = ? AND status = 'active'")
+      .bind(classId)
+      .first();
+    if (studentCount && studentCount.count > 0) {
+      return json({ error: "This class still has students in it. Move or remove them first." }, 409);
+    }
+
+    await env.DB.prepare("DELETE FROM class_subjects WHERE class_id = ?").bind(classId).run();
+    await env.DB.prepare("DELETE FROM classes WHERE id = ?").bind(classId).run();
+
+    return json({ message: "Class deleted." });
+  }
+
+  // ---------------- DELETE SUBJECT ----------------
+  const subjectDetailMatch = pathname.match(/^\/api\/subjects\/([^/]+)$/);
+  if (subjectDetailMatch && request.method === "DELETE") {
+    const sessionCtx = await getSession(request, env);
+    if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const subjectId = subjectDetailMatch[1];
+    await env.DB.prepare("DELETE FROM class_subjects WHERE subject_id = ?").bind(subjectId).run();
+    await env.DB.prepare("DELETE FROM subjects WHERE id = ?").bind(subjectId).run();
+
+    return json({ message: "Subject deleted." });
+  }
+
+  // ---------------- REMOVE STUDENT (soft delete) ----------------
+  const studentDetailMatch = pathname.match(/^\/api\/students\/([^/]+)$/);
+  if (studentDetailMatch && request.method === "DELETE") {
+    const sessionCtx = await getSession(request, env);
+    if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const studentId = studentDetailMatch[1];
+    const student = await env.DB
+      .prepare("SELECT id FROM students WHERE id = ? AND status = 'active'")
+      .bind(studentId)
+      .first();
+    if (!student) return json({ error: "Student not found." }, 404);
+
+    await env.DB
+      .prepare("UPDATE students SET status = 'inactive' WHERE id = ?")
+      .bind(studentId)
+      .run();
+
+    return json({ message: "Student removed." });
   }
 
   return null; // not handled here — let the router try the next module
