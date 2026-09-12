@@ -884,6 +884,11 @@ async function handleAssignmentRoutes(request, env, url) {
  *   POST /api/students/:id/pin         (auth: admin) generate a login PIN for a student for a
  *        given term/session — required before that student can sign in
  *        body: { term, session }
+ *   GET  /api/subjects                 (auth: teaching staff) list subjects, optional ?level=
+ *   POST /api/subjects                 (auth: admin) create a subject { name, level }
+ *   GET  /api/classes/:classId/subjects       (auth: teaching staff) list subjects assigned to a class
+ *   POST /api/classes/:classId/subjects       (auth: admin) assign a subject { subjectId }
+ *   DELETE /api/classes/:classId/subjects/:subjectId  (auth: admin) unassign a subject
  */
 
 /**
@@ -1036,6 +1041,92 @@ async function handleRosterRoutes(request, env, url) {
     }
 
     return json({ message: "PIN generated.", pin, term, session });
+  }
+
+  // ---------------- LIST SUBJECTS ----------------
+  if (pathname === "/api/subjects" && request.method === "GET") {
+    const sessionCtx = await getSession(request, env);
+    if (!isTeachingStaff(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const level = url.searchParams.get("level");
+    const stmt = level
+      ? env.DB.prepare("SELECT * FROM subjects WHERE level = ? ORDER BY name").bind(level)
+      : env.DB.prepare("SELECT * FROM subjects ORDER BY level, name");
+
+    const { results } = await stmt.all();
+    return json({ subjects: results });
+  }
+
+  // ---------------- CREATE SUBJECT ----------------
+  if (pathname === "/api/subjects" && request.method === "POST") {
+    const sessionCtx = await getSession(request, env);
+    if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const { name, level } = await request.json();
+    if (!name || !level) {
+      return json({ error: "name and level are required." }, 400);
+    }
+
+    const id = uuid();
+    await env.DB
+      .prepare(`INSERT INTO subjects (id, name, level) VALUES (?, ?, ?)`)
+      .bind(id, name, level)
+      .run();
+
+    return json({ message: "Subject created.", id });
+  }
+
+  // ---------------- LIST SUBJECTS ASSIGNED TO A CLASS ----------------
+  const classSubjectsMatch = pathname.match(/^\/api\/classes\/([^/]+)\/subjects$/);
+  if (classSubjectsMatch && request.method === "GET") {
+    const sessionCtx = await getSession(request, env);
+    if (!isTeachingStaff(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const classId = classSubjectsMatch[1];
+    const { results } = await env.DB
+      .prepare(
+        `SELECT s.id, s.name, s.level
+         FROM class_subjects cs
+         JOIN subjects s ON s.id = cs.subject_id
+         WHERE cs.class_id = ?
+         ORDER BY s.name`
+      )
+      .bind(classId)
+      .all();
+
+    return json({ classId, subjects: results });
+  }
+
+  // ---------------- ASSIGN A SUBJECT TO A CLASS ----------------
+  if (classSubjectsMatch && request.method === "POST") {
+    const sessionCtx = await getSession(request, env);
+    if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const classId = classSubjectsMatch[1];
+    const { subjectId } = await request.json();
+    if (!subjectId) return json({ error: "subjectId is required." }, 400);
+
+    await env.DB
+      .prepare("INSERT OR IGNORE INTO class_subjects (class_id, subject_id) VALUES (?, ?)")
+      .bind(classId, subjectId)
+      .run();
+
+    return json({ message: "Subject assigned to class." });
+  }
+
+  // ---------------- UNASSIGN A SUBJECT FROM A CLASS ----------------
+  const unassignMatch = pathname.match(/^\/api\/classes\/([^/]+)\/subjects\/([^/]+)$/);
+  if (unassignMatch && request.method === "DELETE") {
+    const sessionCtx = await getSession(request, env);
+    if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const [, classId, subjectId] = unassignMatch;
+    await env.DB
+      .prepare("DELETE FROM class_subjects WHERE class_id = ? AND subject_id = ?")
+      .bind(classId, subjectId)
+      .run();
+
+    return json({ message: "Subject removed from class." });
   }
 
   return null; // not handled here — let the router try the next module
