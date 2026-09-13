@@ -1249,6 +1249,189 @@ async function handleRosterRoutes(request, env, url) {
 }
 
 // =====================================================================
+// SECTION 7C: Results routes (score entry + admin approval)
+// =====================================================================
+/**
+ * FIS Itobe Portal — Worker API (Results: score entry & approval)
+ *
+ * Grading uses the school's existing WAEC-style scale:
+ *   A1 75-100, B2 70-74, B3 65-69, C4 60-64, C5 55-59, C6 50-54,
+ *   D7 45-49, E8 40-44, F9 0-39
+ *
+ * Routes:
+ *   POST /api/results                  (auth: teaching staff) enter/update one student's score
+ *        body: { studentId, classId, subjectId, term, session, ca1, ca2, exam }
+ *        — recomputes total/grade and resets status to 'pending' on every save
+ *   GET  /api/results?classId=&subjectId=&term=&session=   (auth: teaching staff)
+ *        every student in the class with their score for that subject/term/session (or none yet)
+ *   GET  /api/results/pending?classId=&term=&session=      (auth: admin)
+ *        all pending results for a class/term/session, across every subject
+ *   PATCH /api/results/:id             (auth: admin) { status: 'approved' | 'withheld' }
+ *   POST /api/results/approve-class    (auth: admin) { classId, term, session }
+ *        bulk-approves every pending result for that class/term/session
+ */
+
+function computeGrade(total) {
+  if (total === null || total === undefined || isNaN(total)) return null;
+  if (total >= 75) return "A1";
+  if (total >= 70) return "B2";
+  if (total >= 65) return "B3";
+  if (total >= 60) return "C4";
+  if (total >= 55) return "C5";
+  if (total >= 50) return "C6";
+  if (total >= 45) return "D7";
+  if (total >= 40) return "E8";
+  return "F9";
+}
+
+async function handleResultsRoutes(request, env, url) {
+  const { pathname } = url;
+
+  // ---------------- ENTER / UPDATE A SCORE ----------------
+  if (pathname === "/api/results" && request.method === "POST") {
+    const sessionCtx = await getSession(request, env);
+    if (!isTeachingStaff(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const { studentId, classId, subjectId, term, session, ca1, ca2, exam } = await request.json();
+    if (!studentId || !classId || !subjectId || !term || !session) {
+      return json({ error: "studentId, classId, subjectId, term, and session are required." }, 400);
+    }
+
+    const ca1Val = ca1 === "" || ca1 === undefined || ca1 === null ? null : Number(ca1);
+    const ca2Val = ca2 === "" || ca2 === undefined || ca2 === null ? null : Number(ca2);
+    const examVal = exam === "" || exam === undefined || exam === null ? null : Number(exam);
+    const total = (ca1Val || 0) + (ca2Val || 0) + (examVal || 0);
+    const grade = computeGrade(total);
+
+    const existing = await env.DB
+      .prepare("SELECT id FROM results WHERE student_id = ? AND subject_id = ? AND term = ? AND session = ?")
+      .bind(studentId, subjectId, term, session)
+      .first();
+
+    if (existing) {
+      await env.DB
+        .prepare(
+          `UPDATE results SET ca1 = ?, ca2 = ?, exam = ?, grade = ?, status = 'pending',
+                  entered_by = ?, updated_at = datetime('now')
+           WHERE id = ?`
+        )
+        .bind(ca1Val, ca2Val, examVal, grade, sessionCtx.id, existing.id)
+        .run();
+    } else {
+      await env.DB
+        .prepare(
+          `INSERT INTO results (id, student_id, class_id, subject_id, term, session, ca1, ca2, exam, grade, status, entered_by, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, datetime('now'))`
+        )
+        .bind(uuid(), studentId, classId, subjectId, term, session, ca1Val, ca2Val, examVal, grade, sessionCtx.id)
+        .run();
+    }
+
+    return json({ message: "Score saved.", total, grade });
+  }
+
+  // ---------------- LIST SCORES FOR A CLASS/SUBJECT ----------------
+  if (pathname === "/api/results" && request.method === "GET") {
+    const sessionCtx = await getSession(request, env);
+    if (!isTeachingStaff(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const classId = url.searchParams.get("classId");
+    const subjectId = url.searchParams.get("subjectId");
+    const term = url.searchParams.get("term");
+    const session = url.searchParams.get("session");
+    if (!classId || !subjectId || !term || !session) {
+      return json({ error: "classId, subjectId, term, and session are required." }, 400);
+    }
+
+    const { results } = await env.DB
+      .prepare(
+        `SELECT s.id AS student_id, s.name AS student_name,
+                r.id AS result_id, r.ca1, r.ca2, r.exam, r.grade, r.status
+         FROM students s
+         LEFT JOIN results r
+           ON r.student_id = s.id AND r.subject_id = ? AND r.term = ? AND r.session = ?
+         WHERE s.class_id = ? AND s.status = 'active'
+         ORDER BY s.name`
+      )
+      .bind(subjectId, term, session, classId)
+      .all();
+
+    return json({ students: results });
+  }
+
+  // ---------------- LIST PENDING RESULTS FOR A CLASS ----------------
+  if (pathname === "/api/results/pending" && request.method === "GET") {
+    const sessionCtx = await getSession(request, env);
+    if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const classId = url.searchParams.get("classId");
+    const term = url.searchParams.get("term");
+    const session = url.searchParams.get("session");
+    if (!classId || !term || !session) {
+      return json({ error: "classId, term, and session are required." }, 400);
+    }
+
+    const { results } = await env.DB
+      .prepare(
+        `SELECT r.id, r.ca1, r.ca2, r.exam, r.grade, r.status,
+                s.name AS student_name, sub.name AS subject_name
+         FROM results r
+         JOIN students s ON s.id = r.student_id
+         JOIN subjects sub ON sub.id = r.subject_id
+         WHERE r.class_id = ? AND r.term = ? AND r.session = ? AND r.status = 'pending'
+         ORDER BY s.name, sub.name`
+      )
+      .bind(classId, term, session)
+      .all();
+
+    return json({ results });
+  }
+
+  // ---------------- APPROVE / WITHHOLD ONE RESULT ----------------
+  const resultDetailMatch = pathname.match(/^\/api\/results\/([^/]+)$/);
+  if (resultDetailMatch && request.method === "PATCH") {
+    const sessionCtx = await getSession(request, env);
+    if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const resultId = resultDetailMatch[1];
+    const { status } = await request.json();
+    if (!["approved", "withheld", "pending"].includes(status)) {
+      return json({ error: "status must be 'approved', 'withheld', or 'pending'." }, 400);
+    }
+
+    await env.DB
+      .prepare("UPDATE results SET status = ?, updated_at = datetime('now') WHERE id = ?")
+      .bind(status, resultId)
+      .run();
+
+    return json({ message: "Result " + status + "." });
+  }
+
+  // ---------------- BULK-APPROVE ALL PENDING FOR A CLASS ----------------
+  if (pathname === "/api/results/approve-class" && request.method === "POST") {
+    const sessionCtx = await getSession(request, env);
+    if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const { classId, term, session } = await request.json();
+    if (!classId || !term || !session) {
+      return json({ error: "classId, term, and session are required." }, 400);
+    }
+
+    await env.DB
+      .prepare(
+        `UPDATE results SET status = 'approved', updated_at = datetime('now')
+         WHERE class_id = ? AND term = ? AND session = ? AND status = 'pending'`
+      )
+      .bind(classId, term, session)
+      .run();
+
+    return json({ message: "All pending results approved." });
+  }
+
+  return null; // not handled here — let the router try the next module
+}
+
+// =====================================================================
 // SECTION 8: Entry point — routes across all sections above
 // =====================================================================
 const modules = [
@@ -1256,7 +1439,8 @@ const modules = [
   handleStudentAuthRoutes,
   handleAttendanceRoutes,
   handleAssignmentRoutes,
-  handleRosterRoutes
+  handleRosterRoutes,
+  handleResultsRoutes
 ];
 
 function corsHeaders() {
