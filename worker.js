@@ -1249,6 +1249,116 @@ async function handleRosterRoutes(request, env, url) {
 }
 
 // =====================================================================
+// SECTION 7B2: Teacher assignment routes (which teacher handles which
+// class + subject)
+// =====================================================================
+/**
+ * Routes:
+ *   GET  /api/teachers                          (auth: admin) list active teachers
+ *   POST /api/teacher-assignments               (auth: admin) { teacherId, classId, subjectId }
+ *   GET  /api/teacher-assignments?teacherId=&classId=   (auth: admin) list assignments, joined with names
+ *   DELETE /api/teacher-assignments/:id         (auth: admin) remove one assignment
+ */
+async function handleTeacherAssignmentRoutes(request, env, url) {
+  const { pathname } = url;
+
+  // ---------------- LIST TEACHERS ----------------
+  if (pathname === "/api/teachers" && request.method === "GET") {
+    const sessionCtx = await getSession(request, env);
+    if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const { results } = await env.DB
+      .prepare("SELECT id, name, email, level FROM users WHERE role = 'teacher' AND status = 'active' ORDER BY name")
+      .all();
+
+    return json({ teachers: results });
+  }
+
+  // ---------------- ASSIGN A TEACHER TO A CLASS + SUBJECT ----------------
+  if (pathname === "/api/teacher-assignments" && request.method === "POST") {
+    const sessionCtx = await getSession(request, env);
+    if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const { teacherId, classId, subjectId } = await request.json();
+    if (!teacherId || !classId || !subjectId) {
+      return json({ error: "teacherId, classId, and subjectId are required." }, 400);
+    }
+
+    const teacher = await env.DB
+      .prepare("SELECT id FROM users WHERE id = ? AND role = 'teacher' AND status = 'active'")
+      .bind(teacherId)
+      .first();
+    if (!teacher) return json({ error: "Teacher not found." }, 404);
+
+    const validPair = await env.DB
+      .prepare("SELECT 1 FROM class_subjects WHERE class_id = ? AND subject_id = ?")
+      .bind(classId, subjectId)
+      .first();
+    if (!validPair) {
+      return json({ error: "That subject is not assigned to this class yet." }, 400);
+    }
+
+    const existing = await env.DB
+      .prepare("SELECT id FROM teacher_assignments WHERE teacher_id = ? AND class_id = ? AND subject_id = ?")
+      .bind(teacherId, classId, subjectId)
+      .first();
+    if (existing) {
+      return json({ error: "This teacher is already assigned to that class and subject." }, 409);
+    }
+
+    const id = uuid();
+    await env.DB
+      .prepare("INSERT INTO teacher_assignments (id, teacher_id, class_id, subject_id) VALUES (?, ?, ?, ?)")
+      .bind(id, teacherId, classId, subjectId)
+      .run();
+
+    return json({ message: "Teacher assigned.", id });
+  }
+
+  // ---------------- LIST ASSIGNMENTS ----------------
+  if (pathname === "/api/teacher-assignments" && request.method === "GET") {
+    const sessionCtx = await getSession(request, env);
+    if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const teacherId = url.searchParams.get("teacherId");
+    const classId = url.searchParams.get("classId");
+
+    let query = `
+      SELECT ta.id, ta.teacher_id, u.name AS teacher_name,
+             ta.class_id, c.name AS class_name,
+             ta.subject_id, s.name AS subject_name
+      FROM teacher_assignments ta
+      JOIN users u ON u.id = ta.teacher_id
+      JOIN classes c ON c.id = ta.class_id
+      JOIN subjects s ON s.id = ta.subject_id
+    `;
+    const conditions = [];
+    const params = [];
+    if (teacherId) { conditions.push("ta.teacher_id = ?"); params.push(teacherId); }
+    if (classId) { conditions.push("ta.class_id = ?"); params.push(classId); }
+    if (conditions.length) query += " WHERE " + conditions.join(" AND ");
+    query += " ORDER BY c.sort_order, s.name";
+
+    const { results } = await env.DB.prepare(query).bind(...params).all();
+    return json({ assignments: results });
+  }
+
+  // ---------------- REMOVE AN ASSIGNMENT ----------------
+  const assignmentDetailMatch = pathname.match(/^\/api\/teacher-assignments\/([^/]+)$/);
+  if (assignmentDetailMatch && request.method === "DELETE") {
+    const sessionCtx = await getSession(request, env);
+    if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const assignmentId = assignmentDetailMatch[1];
+    await env.DB.prepare("DELETE FROM teacher_assignments WHERE id = ?").bind(assignmentId).run();
+
+    return json({ message: "Assignment removed." });
+  }
+
+  return null; // not handled here — let the router try the next module
+}
+
+// =====================================================================
 // SECTION 7C: Results routes (score entry + admin approval)
 // =====================================================================
 /**
@@ -1440,6 +1550,7 @@ const modules = [
   handleAttendanceRoutes,
   handleAssignmentRoutes,
   handleRosterRoutes,
+  handleTeacherAssignmentRoutes,
   handleResultsRoutes
 ];
 
