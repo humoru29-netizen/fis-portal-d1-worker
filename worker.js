@@ -1495,6 +1495,134 @@ async function handleAdmissionRoutes(request, env, url) {
 }
 
 // =====================================================================
+// SECTION 7E: Manage Accounts routes (admin view/edit/suspend/reset/
+// delete existing staff accounts — separate from Approvals, which
+// only handles brand-new pending signups)
+// =====================================================================
+/**
+ * Routes:
+ *   GET    /api/staff                    (auth: admin) list all non-pending staff accounts
+ *   PATCH  /api/staff/:id                (auth: admin) { role, level } change role/level
+ *   PATCH  /api/staff/:id/status         (auth: admin) { status: 'active'|'suspended' }
+ *   POST   /api/staff/:id/reset-password (auth: admin) generates + returns a new temporary password
+ *   DELETE /api/staff/:id                (auth: admin) permanently remove the account
+ */
+const VALID_STAFF_ROLES = ["teacher", "cashier", "primary_admin", "secondary_admin", "general_admin"];
+
+function generateTempPassword() {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789";
+  let out = "";
+  const bytes = crypto.getRandomValues(new Uint8Array(10));
+  for (let i = 0; i < bytes.length; i++) out += chars[bytes[i] % chars.length];
+  return out;
+}
+
+async function handleManageAccountsRoutes(request, env, url) {
+  const { pathname } = url;
+
+  // ---------------- LIST ALL STAFF ----------------
+  if (pathname === "/api/staff" && request.method === "GET") {
+    const sessionCtx = await getSession(request, env);
+    if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const { results } = await env.DB
+      .prepare(
+        `SELECT id, name, email, role, level, status, created_at, approved_by, approved_at
+         FROM users
+         WHERE status IN ('active', 'suspended')
+         ORDER BY name`
+      )
+      .all();
+
+    return json({ staff: results });
+  }
+
+  // ---------------- CHANGE ROLE / LEVEL ----------------
+  const roleMatch = pathname.match(/^\/api\/staff\/([^/]+)$/);
+  if (roleMatch && request.method === "PATCH") {
+    const sessionCtx = await getSession(request, env);
+    if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const staffId = roleMatch[1];
+    const { role, level } = await request.json();
+
+    if (!VALID_STAFF_ROLES.includes(role)) {
+      return json({ error: "Invalid role." }, 400);
+    }
+
+    const target = await env.DB.prepare("SELECT id FROM users WHERE id = ?").bind(staffId).first();
+    if (!target) return json({ error: "Account not found." }, 404);
+
+    await env.DB
+      .prepare("UPDATE users SET role = ?, level = ? WHERE id = ?")
+      .bind(role, level || null, staffId)
+      .run();
+
+    return json({ message: "Account updated." });
+  }
+
+  // ---------------- SUSPEND / REACTIVATE ----------------
+  const statusMatch = pathname.match(/^\/api\/staff\/([^/]+)\/status$/);
+  if (statusMatch && request.method === "PATCH") {
+    const sessionCtx = await getSession(request, env);
+    if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const staffId = statusMatch[1];
+    const { status } = await request.json();
+
+    if (!["active", "suspended"].includes(status)) {
+      return json({ error: "status must be 'active' or 'suspended'." }, 400);
+    }
+    if (staffId === sessionCtx.id) {
+      return json({ error: "You can't suspend your own account." }, 400);
+    }
+
+    const target = await env.DB.prepare("SELECT id FROM users WHERE id = ?").bind(staffId).first();
+    if (!target) return json({ error: "Account not found." }, 404);
+
+    await env.DB.prepare("UPDATE users SET status = ? WHERE id = ?").bind(status, staffId).run();
+
+    return json({ message: status === "suspended" ? "Account suspended." : "Account reactivated." });
+  }
+
+  // ---------------- RESET PASSWORD ----------------
+  const resetMatch = pathname.match(/^\/api\/staff\/([^/]+)\/reset-password$/);
+  if (resetMatch && request.method === "POST") {
+    const sessionCtx = await getSession(request, env);
+    if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const staffId = resetMatch[1];
+    const target = await env.DB.prepare("SELECT id FROM users WHERE id = ?").bind(staffId).first();
+    if (!target) return json({ error: "Account not found." }, 404);
+
+    const tempPassword = generateTempPassword();
+    const passwordHash = await hash(tempPassword);
+
+    await env.DB.prepare("UPDATE users SET password_hash = ? WHERE id = ?").bind(passwordHash, staffId).run();
+
+    return json({ message: "Password reset.", tempPassword });
+  }
+
+  // ---------------- DELETE ACCOUNT ----------------
+  const deleteMatch = pathname.match(/^\/api\/staff\/([^/]+)$/);
+  if (deleteMatch && request.method === "DELETE") {
+    const sessionCtx = await getSession(request, env);
+    if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const staffId = deleteMatch[1];
+    if (staffId === sessionCtx.id) {
+      return json({ error: "You can't delete your own account." }, 400);
+    }
+
+    await env.DB.prepare("DELETE FROM users WHERE id = ?").bind(staffId).run();
+
+    return json({ message: "Account deleted." });
+  }
+
+  return null; // not handled here — let the router try the next module
+}
+
+// =====================================================================
 // SECTION 7C: Results routes (score entry + admin approval)
 // =====================================================================
 /**
@@ -1688,6 +1816,7 @@ const modules = [
   handleRosterRoutes,
   handleTeacherAssignmentRoutes,
   handleAdmissionRoutes,
+  handleManageAccountsRoutes,
   handleResultsRoutes
 ];
 
