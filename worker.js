@@ -1851,6 +1851,151 @@ async function handleFeesRoutes(request, env, url) {
 }
 
 // =====================================================================
+// SECTION 7G: Report Card routes (pulls together results, attendance,
+// class rank, and fee status for one student/term)
+// =====================================================================
+/**
+ * Routes:
+ *   GET /api/report-card/:studentId?term=&session=
+ *       (auth: teaching staff/admin, or the student viewing their own)
+ *       Only APPROVED results are included — pendingSubjectCount tells
+ *       you how many scores for that student still aren't approved yet.
+ */
+async function handleReportCardRoutes(request, env, url) {
+  const { pathname } = url;
+
+  const match = pathname.match(/^\/api\/report-card\/([^/]+)$/);
+  if (match && request.method === "GET") {
+    const sessionCtx = await getSession(request, env);
+    const studentId = match[1];
+    if (!isTeachingStaff(sessionCtx) && !isOwnStudent(sessionCtx, studentId)) {
+      return json({ error: "Not authorised." }, 403);
+    }
+
+    const term = url.searchParams.get("term");
+    const session = url.searchParams.get("session");
+    if (!term || !session) return json({ error: "term and session are required." }, 400);
+
+    const student = await env.DB
+      .prepare(
+        `SELECT s.id, s.name, s.admission_no, s.class_id, c.name AS class_name, c.level
+         FROM students s JOIN classes c ON c.id = s.class_id
+         WHERE s.id = ?`
+      )
+      .bind(studentId)
+      .first();
+    if (!student) return json({ error: "Student not found." }, 404);
+
+    // ---- Subject scores (approved only) ----
+    const { results: subjectRows } = await env.DB
+      .prepare(
+        `SELECT r.subject_id, sub.name AS subject_name, r.ca1, r.ca2, r.exam, r.grade
+         FROM results r
+         JOIN subjects sub ON sub.id = r.subject_id
+         WHERE r.student_id = ? AND r.term = ? AND r.session = ? AND r.status = 'approved'
+         ORDER BY sub.name`
+      )
+      .bind(studentId, term, session)
+      .all();
+
+    const subjects = subjectRows.map(r => ({
+      subjectId: r.subject_id,
+      subjectName: r.subject_name,
+      ca1: r.ca1,
+      ca2: r.ca2,
+      exam: r.exam,
+      total: (r.ca1 || 0) + (r.ca2 || 0) + (r.exam || 0),
+      grade: r.grade
+    }));
+
+    const overallTotal = subjects.reduce((sum, s) => sum + s.total, 0);
+    const average = subjects.length ? overallTotal / subjects.length : null;
+
+    const pendingRow = await env.DB
+      .prepare(
+        `SELECT COUNT(*) AS count FROM results
+         WHERE student_id = ? AND term = ? AND session = ? AND status != 'approved'`
+      )
+      .bind(studentId, term, session)
+      .first();
+
+    // ---- Class rank (among students with at least one approved result) ----
+    const { results: classAverages } = await env.DB
+      .prepare(
+        `SELECT student_id, AVG(ca1 + ca2 + exam) AS avg_score
+         FROM results
+         WHERE class_id = ? AND term = ? AND session = ? AND status = 'approved'
+         GROUP BY student_id
+         ORDER BY avg_score DESC`
+      )
+      .bind(student.class_id, term, session)
+      .all();
+
+    const rankIndex = classAverages.findIndex(r => r.student_id === studentId);
+    const position = rankIndex === -1 ? null : rankIndex + 1;
+    const outOf = classAverages.length;
+
+    // ---- Attendance for the term ----
+    const attendance = await env.DB
+      .prepare(
+        `SELECT
+           SUM(CASE WHEN status = 'present' THEN 1 ELSE 0 END) AS present_count,
+           SUM(CASE WHEN status = 'absent'  THEN 1 ELSE 0 END) AS absent_count,
+           SUM(CASE WHEN status = 'late'    THEN 1 ELSE 0 END) AS late_count,
+           SUM(CASE WHEN status = 'excused' THEN 1 ELSE 0 END) AS excused_count,
+           COUNT(*) AS total_marked
+         FROM attendance
+         WHERE student_id = ? AND term = ? AND session = ?`
+      )
+      .bind(studentId, term, session)
+      .first();
+
+    // ---- Fee status for the term ----
+    const feeStructure = await env.DB
+      .prepare("SELECT amount FROM fee_structures WHERE class_id = ? AND term = ? AND session = ?")
+      .bind(student.class_id, term, session)
+      .first();
+    const feeAmount = feeStructure ? feeStructure.amount : 0;
+    const feePaidRow = await env.DB
+      .prepare("SELECT COALESCE(SUM(amount), 0) AS total FROM fee_transactions WHERE student_id = ? AND term = ? AND session = ?")
+      .bind(studentId, term, session)
+      .first();
+
+    return json({
+      student: {
+        id: student.id,
+        name: student.name,
+        admissionNo: student.admission_no,
+        className: student.class_name,
+        level: student.level
+      },
+      term,
+      session,
+      subjects,
+      overallTotal,
+      average,
+      pendingSubjectCount: pendingRow.count,
+      position,
+      outOf,
+      attendance: {
+        present: attendance.present_count || 0,
+        absent: attendance.absent_count || 0,
+        late: attendance.late_count || 0,
+        excused: attendance.excused_count || 0,
+        totalMarked: attendance.total_marked || 0
+      },
+      fee: {
+        amount: feeAmount,
+        paid: feePaidRow.total,
+        balance: feeAmount - feePaidRow.total
+      }
+    });
+  }
+
+  return null; // not handled here — let the router try the next module
+}
+
+// =====================================================================
 // SECTION 7C: Results routes (score entry + admin approval)
 // =====================================================================
 /**
@@ -2046,6 +2191,7 @@ const modules = [
   handleAdmissionRoutes,
   handleManageAccountsRoutes,
   handleFeesRoutes,
+  handleReportCardRoutes,
   handleResultsRoutes
 ];
 
