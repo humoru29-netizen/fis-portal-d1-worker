@@ -1860,7 +1860,19 @@ async function handleFeesRoutes(request, env, url) {
  *       (auth: teaching staff/admin, or the student viewing their own)
  *       Only APPROVED results are included — pendingSubjectCount tells
  *       you how many scores for that student still aren't approved yet.
+ *   PUT /api/report-remarks/:studentId
+ *       (auth: teaching staff for teacherRemark, admin for principalRemark)
+ *       body: { term, session, teacherRemark?, principalRemark? }
  */
+function suggestPrincipalRemark(average) {
+  if (average === null || average === undefined) return "No results available yet for this term.";
+  if (average >= 75) return "Excellent result. Keep up the outstanding performance.";
+  if (average >= 65) return "Very good performance. Strive for the top.";
+  if (average >= 55) return "Good result. There is still room for improvement.";
+  if (average >= 45) return "Fair performance. More effort is required.";
+  if (average >= 40) return "Below average. Needs to work much harder.";
+  return "Poor performance. Serious improvement is required.";
+}
 async function handleReportCardRoutes(request, env, url) {
   const { pathname } = url;
 
@@ -1961,6 +1973,12 @@ async function handleReportCardRoutes(request, env, url) {
       .bind(studentId, term, session)
       .first();
 
+    // ---- Remarks ----
+    const remarksRow = await env.DB
+      .prepare("SELECT teacher_remark, principal_remark FROM report_remarks WHERE student_id = ? AND term = ? AND session = ?")
+      .bind(studentId, term, session)
+      .first();
+
     return json({
       student: {
         id: student.id,
@@ -1988,8 +2006,55 @@ async function handleReportCardRoutes(request, env, url) {
         amount: feeAmount,
         paid: feePaidRow.total,
         balance: feeAmount - feePaidRow.total
-      }
+      },
+      teacherRemark: remarksRow ? remarksRow.teacher_remark : null,
+      principalRemark: remarksRow ? remarksRow.principal_remark : null,
+      suggestedPrincipalRemark: suggestPrincipalRemark(average)
     });
+  }
+
+  // ---------------- SAVE TEACHER/PRINCIPAL REMARK ----------------
+  const remarkMatch = pathname.match(/^\/api\/report-remarks\/([^/]+)$/);
+  if (remarkMatch && request.method === "PUT") {
+    const sessionCtx = await getSession(request, env);
+    const studentId = remarkMatch[1];
+    const { term, session, teacherRemark, principalRemark } = await request.json();
+
+    if (!term || !session) return json({ error: "term and session are required." }, 400);
+    if (teacherRemark === undefined && principalRemark === undefined) {
+      return json({ error: "Provide teacherRemark and/or principalRemark." }, 400);
+    }
+    if (teacherRemark !== undefined && !isTeachingStaff(sessionCtx)) {
+      return json({ error: "Not authorised to set the teacher remark." }, 403);
+    }
+    if (principalRemark !== undefined && !isAdminSession(sessionCtx)) {
+      return json({ error: "Not authorised to set the principal remark." }, 403);
+    }
+
+    const existing = await env.DB
+      .prepare("SELECT id, teacher_remark, principal_remark FROM report_remarks WHERE student_id = ? AND term = ? AND session = ?")
+      .bind(studentId, term, session)
+      .first();
+
+    const nextTeacherRemark = teacherRemark !== undefined ? teacherRemark : (existing ? existing.teacher_remark : null);
+    const nextPrincipalRemark = principalRemark !== undefined ? principalRemark : (existing ? existing.principal_remark : null);
+
+    if (existing) {
+      await env.DB
+        .prepare("UPDATE report_remarks SET teacher_remark = ?, principal_remark = ?, updated_at = datetime('now') WHERE id = ?")
+        .bind(nextTeacherRemark, nextPrincipalRemark, existing.id)
+        .run();
+    } else {
+      await env.DB
+        .prepare(
+          `INSERT INTO report_remarks (id, student_id, term, session, teacher_remark, principal_remark, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, datetime('now'))`
+        )
+        .bind(uuid(), studentId, term, session, nextTeacherRemark, nextPrincipalRemark)
+        .run();
+    }
+
+    return json({ message: "Remark saved." });
   }
 
   return null; // not handled here — let the router try the next module
