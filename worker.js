@@ -1262,7 +1262,7 @@ const modules = [
 function corsHeaders() {
   return {
     "Access-Control-Allow-Origin": "*", // tighten to your portal's domain before production
-    "Access-Control-Allow-Methods": "GET,POST,PATCH,OPTIONS",
+    "Access-Control-Allow-Methods": "GET,POST,PATCH,DELETE,OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type,Authorization"
   };
 }
