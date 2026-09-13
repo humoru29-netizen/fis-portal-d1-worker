@@ -1623,6 +1623,234 @@ async function handleManageAccountsRoutes(request, env, url) {
 }
 
 // =====================================================================
+// SECTION 7F: Fees routes (fee structure per class/term + payment
+// logging + balances + collection totals)
+// =====================================================================
+/**
+ * Routes:
+ *   POST /api/fee-structures                  (auth: admin) set/update the fee amount for a class/term/session
+ *   GET  /api/fee-structures?term=&session=   (auth: cashier/admin) list fee amount per class for a term
+ *   POST /api/fees/payments                   (auth: cashier/admin) record a payment — ALWAYS live, never queued offline
+ *   GET  /api/fees/student/:studentId?term=&session=  (auth: cashier/admin) fee owed, paid, balance, and payment history
+ *   GET  /api/fees/class/:classId?term=&session=      (auth: cashier/admin) per-student paid/balance for a class
+ *   GET  /api/fees/totals?term=&session=              (auth: cashier/admin) amount collected today/this week/this month/this term
+ */
+function isFeeStaff(session) {
+  return isStaff(session) && ["cashier", "general_admin", "primary_admin", "secondary_admin"].includes(session.role);
+}
+
+async function handleFeesRoutes(request, env, url) {
+  const { pathname } = url;
+
+  // ---------------- SET/UPDATE FEE STRUCTURE ----------------
+  if (pathname === "/api/fee-structures" && request.method === "POST") {
+    const sessionCtx = await getSession(request, env);
+    if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const { classId, term, session, amount } = await request.json();
+    if (!classId || !term || !session || amount === undefined || amount === null) {
+      return json({ error: "classId, term, session, and amount are required." }, 400);
+    }
+    if (isNaN(amount) || Number(amount) < 0) {
+      return json({ error: "amount must be a non-negative number." }, 400);
+    }
+
+    const existing = await env.DB
+      .prepare("SELECT id FROM fee_structures WHERE class_id = ? AND term = ? AND session = ?")
+      .bind(classId, term, session)
+      .first();
+
+    if (existing) {
+      await env.DB.prepare("UPDATE fee_structures SET amount = ? WHERE id = ?").bind(Number(amount), existing.id).run();
+    } else {
+      await env.DB
+        .prepare("INSERT INTO fee_structures (id, class_id, term, session, amount, created_at) VALUES (?, ?, ?, ?, ?, datetime('now'))")
+        .bind(uuid(), classId, term, session, Number(amount))
+        .run();
+    }
+
+    return json({ message: "Fee amount saved." });
+  }
+
+  // ---------------- LIST FEE STRUCTURES FOR A TERM ----------------
+  if (pathname === "/api/fee-structures" && request.method === "GET") {
+    const sessionCtx = await getSession(request, env);
+    if (!isFeeStaff(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const term = url.searchParams.get("term");
+    const session = url.searchParams.get("session");
+    if (!term || !session) return json({ error: "term and session are required." }, 400);
+
+    const { results } = await env.DB
+      .prepare(
+        `SELECT c.id AS class_id, c.name AS class_name, fs.amount
+         FROM classes c
+         LEFT JOIN fee_structures fs ON fs.class_id = c.id AND fs.term = ? AND fs.session = ?
+         ORDER BY c.sort_order`
+      )
+      .bind(term, session)
+      .all();
+
+    return json({ term, session, classes: results });
+  }
+
+  // ---------------- RECORD A PAYMENT (always live — never offline-queued) ----------------
+  if (pathname === "/api/fees/payments" && request.method === "POST") {
+    const sessionCtx = await getSession(request, env);
+    if (!isFeeStaff(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const { studentId, amount, type, term, session, notes } = await request.json();
+    if (!studentId || !amount || !type || !term || !session) {
+      return json({ error: "studentId, amount, type, term, and session are required." }, 400);
+    }
+    if (isNaN(amount) || Number(amount) <= 0) {
+      return json({ error: "amount must be a positive number." }, 400);
+    }
+
+    const student = await env.DB.prepare("SELECT id, name FROM students WHERE id = ?").bind(studentId).first();
+    if (!student) return json({ error: "Student not found." }, 404);
+
+    const id = uuid();
+    await env.DB
+      .prepare(
+        `INSERT INTO fee_transactions
+           (id, student_id, student_name_snapshot, amount, type, term, session, recorded_by, recorded_at, notes)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?)`
+      )
+      .bind(id, studentId, student.name, Number(amount), type, term, session, sessionCtx.id, notes || null)
+      .run();
+
+    return json({ message: "Payment recorded.", id });
+  }
+
+  // ---------------- STUDENT FEE STATUS + HISTORY ----------------
+  const studentFeeMatch = pathname.match(/^\/api\/fees\/student\/([^/]+)$/);
+  if (studentFeeMatch && request.method === "GET") {
+    const sessionCtx = await getSession(request, env);
+    if (!isFeeStaff(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const studentId = studentFeeMatch[1];
+    const term = url.searchParams.get("term");
+    const session = url.searchParams.get("session");
+    if (!term || !session) return json({ error: "term and session are required." }, 400);
+
+    const student = await env.DB.prepare("SELECT id, name, class_id FROM students WHERE id = ?").bind(studentId).first();
+    if (!student) return json({ error: "Student not found." }, 404);
+
+    const structure = await env.DB
+      .prepare("SELECT amount FROM fee_structures WHERE class_id = ? AND term = ? AND session = ?")
+      .bind(student.class_id, term, session)
+      .first();
+    const feeAmount = structure ? structure.amount : 0;
+
+    const paidRow = await env.DB
+      .prepare("SELECT COALESCE(SUM(amount), 0) AS total FROM fee_transactions WHERE student_id = ? AND term = ? AND session = ?")
+      .bind(studentId, term, session)
+      .first();
+    const totalPaid = paidRow.total;
+
+    const { results: transactions } = await env.DB
+      .prepare(
+        `SELECT id, amount, type, notes, recorded_at
+         FROM fee_transactions
+         WHERE student_id = ? AND term = ? AND session = ?
+         ORDER BY recorded_at DESC`
+      )
+      .bind(studentId, term, session)
+      .all();
+
+    return json({
+      studentId,
+      studentName: student.name,
+      feeAmount,
+      totalPaid,
+      balance: feeAmount - totalPaid,
+      transactions
+    });
+  }
+
+  // ---------------- CLASS FEE OVERVIEW ----------------
+  const classFeeMatch = pathname.match(/^\/api\/fees\/class\/([^/]+)$/);
+  if (classFeeMatch && request.method === "GET") {
+    const sessionCtx = await getSession(request, env);
+    if (!isFeeStaff(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const classId = classFeeMatch[1];
+    const term = url.searchParams.get("term");
+    const session = url.searchParams.get("session");
+    if (!term || !session) return json({ error: "term and session are required." }, 400);
+
+    const structure = await env.DB
+      .prepare("SELECT amount FROM fee_structures WHERE class_id = ? AND term = ? AND session = ?")
+      .bind(classId, term, session)
+      .first();
+    const feeAmount = structure ? structure.amount : 0;
+
+    const { results } = await env.DB
+      .prepare(
+        `SELECT s.id, s.name,
+                COALESCE(SUM(ft.amount), 0) AS paid
+         FROM students s
+         LEFT JOIN fee_transactions ft
+           ON ft.student_id = s.id AND ft.term = ? AND ft.session = ?
+         WHERE s.class_id = ? AND s.status = 'active'
+         GROUP BY s.id, s.name
+         ORDER BY s.name`
+      )
+      .bind(term, session, classId)
+      .all();
+
+    const students = results.map(r => ({ id: r.id, name: r.name, paid: r.paid, balance: feeAmount - r.paid }));
+
+    return json({ classId, term, session, feeAmount, students });
+  }
+
+  // ---------------- COLLECTION TOTALS (today / week / month / term) ----------------
+  if (pathname === "/api/fees/totals" && request.method === "GET") {
+    const sessionCtx = await getSession(request, env);
+    if (!isFeeStaff(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const term = url.searchParams.get("term");
+    const session = url.searchParams.get("session");
+    if (!term || !session) return json({ error: "term and session are required." }, 400);
+
+    const now = new Date();
+    const todayStr = now.toISOString().slice(0, 10);
+    const weekStart = new Date(now);
+    weekStart.setUTCDate(weekStart.getUTCDate() - 6);
+    const weekStartStr = weekStart.toISOString().slice(0, 10);
+    const monthStartStr = todayStr.slice(0, 7) + "-01";
+
+    async function sumSince(sinceDate) {
+      const row = await env.DB
+        .prepare(
+          `SELECT COALESCE(SUM(amount), 0) AS total, COUNT(*) AS count
+           FROM fee_transactions
+           WHERE term = ? AND session = ? AND date(recorded_at) >= date(?)`
+        )
+        .bind(term, session, sinceDate)
+        .first();
+      return { total: row.total, count: row.count };
+    }
+
+    const termRow = await env.DB
+      .prepare("SELECT COALESCE(SUM(amount), 0) AS total, COUNT(*) AS count FROM fee_transactions WHERE term = ? AND session = ?")
+      .bind(term, session)
+      .first();
+
+    return json({
+      term, session,
+      today: await sumSince(todayStr),
+      week: await sumSince(weekStartStr),
+      month: await sumSince(monthStartStr),
+      termTotal: { total: termRow.total, count: termRow.count }
+    });
+  }
+
+  return null; // not handled here — let the router try the next module
+}
+
+// =====================================================================
 // SECTION 7C: Results routes (score entry + admin approval)
 // =====================================================================
 /**
@@ -1817,6 +2045,7 @@ const modules = [
   handleTeacherAssignmentRoutes,
   handleAdmissionRoutes,
   handleManageAccountsRoutes,
+  handleFeesRoutes,
   handleResultsRoutes
 ];
 
