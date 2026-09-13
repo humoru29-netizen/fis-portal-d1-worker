@@ -1412,16 +1412,18 @@ async function handleAdmissionRoutes(request, env, url) {
     const level = url.searchParams.get("level");
 
     let query = `
-      SELECT id, student_name, dob, gender, level_applied, class_applied,
-             guardian_name, guardian_phone, guardian_email, address,
-             prior_school, health_notes, status, admission_no, assigned_class,
-             submitted_at, decided_by, decided_at
-      FROM admission_applications
-      WHERE status = ?
+      SELECT aa.id, aa.student_name, aa.dob, aa.gender, aa.level_applied, aa.class_applied,
+             aa.guardian_name, aa.guardian_phone, aa.guardian_email, aa.address,
+             aa.prior_school, aa.health_notes, aa.status, aa.admission_no, aa.assigned_class,
+             c.name AS assigned_class_name,
+             aa.submitted_at, aa.decided_by, aa.decided_at
+      FROM admission_applications aa
+      LEFT JOIN classes c ON c.id = aa.assigned_class
+      WHERE aa.status = ?
     `;
     const params = [status];
-    if (level) { query += " AND level_applied = ?"; params.push(level); }
-    query += " ORDER BY submitted_at DESC";
+    if (level) { query += " AND aa.level_applied = ?"; params.push(level); }
+    query += " ORDER BY aa.submitted_at DESC";
 
     const { results } = await env.DB.prepare(query).bind(...params).all();
     return json({ applications: results });
