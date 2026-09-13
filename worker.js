@@ -1359,6 +1359,140 @@ async function handleTeacherAssignmentRoutes(request, env, url) {
 }
 
 // =====================================================================
+// SECTION 7D: Admissions routes (public apply form + admin review)
+// =====================================================================
+/**
+ * Routes:
+ *   POST /api/admissions/apply                (public, no auth) submit an application
+ *   GET  /api/admissions?status=&level=       (auth: admin) list applications
+ *   PATCH /api/admissions/:id                 (auth: admin) { action: 'approve'|'reject', classId }
+ *        approve creates the student record + admission number automatically
+ */
+async function handleAdmissionRoutes(request, env, url) {
+  const { pathname } = url;
+
+  // ---------------- PUBLIC: SUBMIT APPLICATION ----------------
+  if (pathname === "/api/admissions/apply" && request.method === "POST") {
+    const body = await request.json();
+    const {
+      studentName, dob, gender, levelApplied, classApplied,
+      guardianName, guardianPhone, guardianEmail, address,
+      priorSchool, healthNotes
+    } = body;
+
+    if (!studentName || !levelApplied || !guardianName || !guardianPhone) {
+      return json({ error: "studentName, levelApplied, guardianName, and guardianPhone are required." }, 400);
+    }
+
+    const id = uuid();
+    await env.DB
+      .prepare(
+        `INSERT INTO admission_applications
+           (id, student_name, dob, gender, level_applied, class_applied,
+            guardian_name, guardian_phone, guardian_email, address,
+            prior_school, health_notes, raw_form_json, status, submitted_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', datetime('now'))`
+      )
+      .bind(
+        id, studentName, dob || null, gender || null, levelApplied, classApplied || null,
+        guardianName, guardianPhone, guardianEmail || null, address || null,
+        priorSchool || null, healthNotes || null, JSON.stringify(body)
+      )
+      .run();
+
+    return json({ message: "Application submitted. The school will contact you after review.", id });
+  }
+
+  // ---------------- ADMIN: LIST APPLICATIONS ----------------
+  if (pathname === "/api/admissions" && request.method === "GET") {
+    const sessionCtx = await getSession(request, env);
+    if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const status = url.searchParams.get("status") || "pending";
+    const level = url.searchParams.get("level");
+
+    let query = `
+      SELECT id, student_name, dob, gender, level_applied, class_applied,
+             guardian_name, guardian_phone, guardian_email, address,
+             prior_school, health_notes, status, admission_no, assigned_class,
+             submitted_at, decided_by, decided_at
+      FROM admission_applications
+      WHERE status = ?
+    `;
+    const params = [status];
+    if (level) { query += " AND level_applied = ?"; params.push(level); }
+    query += " ORDER BY submitted_at DESC";
+
+    const { results } = await env.DB.prepare(query).bind(...params).all();
+    return json({ applications: results });
+  }
+
+  // ---------------- ADMIN: DECIDE (APPROVE / REJECT) ----------------
+  const decisionMatch = pathname.match(/^\/api\/admissions\/([^/]+)$/);
+  if (decisionMatch && request.method === "PATCH") {
+    const sessionCtx = await getSession(request, env);
+    if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const applicationId = decisionMatch[1];
+    const { action, classId } = await request.json();
+    if (!["approve", "reject"].includes(action)) {
+      return json({ error: "action must be 'approve' or 'reject'." }, 400);
+    }
+
+    const application = await env.DB
+      .prepare("SELECT * FROM admission_applications WHERE id = ? AND status = 'pending'")
+      .bind(applicationId)
+      .first();
+    if (!application) return json({ error: "Pending application not found." }, 404);
+
+    if (action === "reject") {
+      await env.DB
+        .prepare(
+          `UPDATE admission_applications SET status = 'rejected', decided_by = ?, decided_at = datetime('now')
+           WHERE id = ?`
+        )
+        .bind(sessionCtx.id, applicationId)
+        .run();
+
+      return json({ message: "Application rejected." });
+    }
+
+    // action === "approve"
+    if (!classId) return json({ error: "classId is required to approve an application." }, 400);
+
+    const targetClass = await env.DB
+      .prepare("SELECT id, level FROM classes WHERE id = ?")
+      .bind(classId)
+      .first();
+    if (!targetClass) return json({ error: "Class not found." }, 404);
+
+    const admissionNo = await generateAdmissionNo(env);
+    const studentId = uuid();
+
+    await env.DB
+      .prepare(
+        `INSERT INTO students (id, admission_no, name, class_id, level, guardian_name, guardian_phone, status, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'active', datetime('now'))`
+      )
+      .bind(studentId, admissionNo, application.student_name, classId, targetClass.level, application.guardian_name, application.guardian_phone)
+      .run();
+
+    await env.DB
+      .prepare(
+        `UPDATE admission_applications
+         SET status = 'approved', admission_no = ?, assigned_class = ?, decided_by = ?, decided_at = datetime('now')
+         WHERE id = ?`
+      )
+      .bind(admissionNo, classId, sessionCtx.id, applicationId)
+      .run();
+
+    return json({ message: "Application approved and student enrolled.", admissionNo, studentId });
+  }
+
+  return null; // not handled here — let the router try the next module
+}
+
+// =====================================================================
 // SECTION 7C: Results routes (score entry + admin approval)
 // =====================================================================
 /**
@@ -1551,6 +1685,7 @@ const modules = [
   handleAssignmentRoutes,
   handleRosterRoutes,
   handleTeacherAssignmentRoutes,
+  handleAdmissionRoutes,
   handleResultsRoutes
 ];
 
