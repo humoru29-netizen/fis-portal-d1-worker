@@ -2061,6 +2061,318 @@ async function handleReportCardRoutes(request, env, url) {
 }
 
 // =====================================================================
+// SECTION 7H: CBT routes (Computer-Based Testing — MCQ/True-False,
+// created by teachers/admins, taken by students, auto-graded instantly)
+// =====================================================================
+/**
+ * Routes (teaching staff = teacher or admin):
+ *   POST   /api/cbt/tests                       (teaching staff) create a test (starts as 'draft')
+ *   GET    /api/cbt/tests?classId=&term=&session=  (teaching staff) list tests for a class
+ *   PATCH  /api/cbt/tests/:id                    (teaching staff) update title/duration/status
+ *   DELETE /api/cbt/tests/:id                    (teaching staff) delete test + its questions/submissions
+ *   POST   /api/cbt/tests/:id/questions          (teaching staff) add a question
+ *   GET    /api/cbt/tests/:id/questions          (teaching staff) list questions (includes correct answers)
+ *   DELETE /api/cbt/tests/:id/questions/:qId     (teaching staff) remove a question
+ *   GET    /api/cbt/tests/:id/results            (teaching staff) list of student scores
+ *
+ * Routes (student — sees only their own class's published tests):
+ *   GET  /api/cbt/available                      (student) published tests for their class, with submitted/score if taken
+ *   GET  /api/cbt/tests/:id/take                 (student) questions WITHOUT correct answers, to attempt
+ *   POST /api/cbt/tests/:id/submit               (student) { answers: {questionId: 'A'|'B'|'C'|'D'|'true'|'false'} }
+ */
+async function handleCbtRoutes(request, env, url) {
+  const { pathname } = url;
+
+  // ---------------- CREATE TEST ----------------
+  if (pathname === "/api/cbt/tests" && request.method === "POST") {
+    const sessionCtx = await getSession(request, env);
+    if (!isTeachingStaff(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const { title, classId, subjectId, term, session, durationMinutes } = await request.json();
+    if (!title || !classId || !subjectId || !term || !session || !durationMinutes) {
+      return json({ error: "title, classId, subjectId, term, session, and durationMinutes are required." }, 400);
+    }
+    if (isNaN(durationMinutes) || Number(durationMinutes) <= 0) {
+      return json({ error: "durationMinutes must be a positive number." }, 400);
+    }
+
+    const id = uuid();
+    await env.DB
+      .prepare(
+        `INSERT INTO cbt_tests (id, title, class_id, subject_id, term, session, duration_minutes, status, created_by, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'draft', ?, datetime('now'))`
+      )
+      .bind(id, title, classId, subjectId, term, session, Number(durationMinutes), sessionCtx.id)
+      .run();
+
+    return json({ message: "Test created as a draft. Add questions, then publish it.", id });
+  }
+
+  // ---------------- LIST TESTS FOR A CLASS ----------------
+  if (pathname === "/api/cbt/tests" && request.method === "GET") {
+    const sessionCtx = await getSession(request, env);
+    if (!isTeachingStaff(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const classId = url.searchParams.get("classId");
+    const term = url.searchParams.get("term");
+    const session = url.searchParams.get("session");
+    if (!classId || !term || !session) return json({ error: "classId, term, and session are required." }, 400);
+
+    const { results } = await env.DB
+      .prepare(
+        `SELECT t.id, t.title, t.duration_minutes, t.status, t.created_at, sub.name AS subject_name,
+                (SELECT COUNT(*) FROM cbt_questions q WHERE q.test_id = t.id) AS question_count,
+                (SELECT COUNT(*) FROM cbt_submissions s WHERE s.test_id = t.id) AS submission_count
+         FROM cbt_tests t
+         JOIN subjects sub ON sub.id = t.subject_id
+         WHERE t.class_id = ? AND t.term = ? AND t.session = ?
+         ORDER BY t.created_at DESC`
+      )
+      .bind(classId, term, session)
+      .all();
+
+    return json({ tests: results });
+  }
+
+  // ---------------- UPDATE TEST (title/duration/status) ----------------
+  const testMatch = pathname.match(/^\/api\/cbt\/tests\/([^/]+)$/);
+  if (testMatch && request.method === "PATCH") {
+    const sessionCtx = await getSession(request, env);
+    if (!isTeachingStaff(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const testId = testMatch[1];
+    const { title, durationMinutes, status } = await request.json();
+
+    const test = await env.DB.prepare("SELECT id FROM cbt_tests WHERE id = ?").bind(testId).first();
+    if (!test) return json({ error: "Test not found." }, 404);
+
+    if (status !== undefined) {
+      if (!["draft", "published"].includes(status)) return json({ error: "status must be 'draft' or 'published'." }, 400);
+      if (status === "published") {
+        const qCount = await env.DB.prepare("SELECT COUNT(*) AS count FROM cbt_questions WHERE test_id = ?").bind(testId).first();
+        if (qCount.count === 0) return json({ error: "Add at least one question before publishing." }, 400);
+      }
+      await env.DB.prepare("UPDATE cbt_tests SET status = ? WHERE id = ?").bind(status, testId).run();
+    }
+    if (title !== undefined) {
+      await env.DB.prepare("UPDATE cbt_tests SET title = ? WHERE id = ?").bind(title, testId).run();
+    }
+    if (durationMinutes !== undefined) {
+      await env.DB.prepare("UPDATE cbt_tests SET duration_minutes = ? WHERE id = ?").bind(Number(durationMinutes), testId).run();
+    }
+
+    return json({ message: "Test updated." });
+  }
+
+  // ---------------- DELETE TEST ----------------
+  if (testMatch && request.method === "DELETE") {
+    const sessionCtx = await getSession(request, env);
+    if (!isTeachingStaff(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const testId = testMatch[1];
+    await env.DB.prepare("DELETE FROM cbt_submissions WHERE test_id = ?").bind(testId).run();
+    await env.DB.prepare("DELETE FROM cbt_questions WHERE test_id = ?").bind(testId).run();
+    await env.DB.prepare("DELETE FROM cbt_tests WHERE id = ?").bind(testId).run();
+
+    return json({ message: "Test deleted." });
+  }
+
+  // ---------------- ADD A QUESTION ----------------
+  const questionsMatch = pathname.match(/^\/api\/cbt\/tests\/([^/]+)\/questions$/);
+  if (questionsMatch && request.method === "POST") {
+    const sessionCtx = await getSession(request, env);
+    if (!isTeachingStaff(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const testId = questionsMatch[1];
+    const test = await env.DB.prepare("SELECT id, status FROM cbt_tests WHERE id = ?").bind(testId).first();
+    if (!test) return json({ error: "Test not found." }, 404);
+    if (test.status === "published") return json({ error: "Unpublish the test before editing its questions." }, 400);
+
+    const { questionText, type, optionA, optionB, optionC, optionD, correctOption, points } = await request.json();
+    if (!questionText || !type || !correctOption) {
+      return json({ error: "questionText, type, and correctOption are required." }, 400);
+    }
+    if (!["mcq", "true_false"].includes(type)) return json({ error: "type must be 'mcq' or 'true_false'." }, 400);
+    if (type === "mcq" && (!optionA || !optionB)) {
+      return json({ error: "MCQ questions need at least optionA and optionB." }, 400);
+    }
+    if (type === "true_false" && !["true", "false"].includes(correctOption)) {
+      return json({ error: "For true_false questions, correctOption must be 'true' or 'false'." }, 400);
+    }
+    if (type === "mcq" && !["A", "B", "C", "D"].includes(correctOption)) {
+      return json({ error: "For mcq questions, correctOption must be 'A', 'B', 'C', or 'D'." }, 400);
+    }
+
+    const countRow = await env.DB.prepare("SELECT COUNT(*) AS count FROM cbt_questions WHERE test_id = ?").bind(testId).first();
+
+    const id = uuid();
+    await env.DB
+      .prepare(
+        `INSERT INTO cbt_questions (id, test_id, question_text, type, option_a, option_b, option_c, option_d, correct_option, points, sort_order)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .bind(id, testId, questionText, type, optionA || null, optionB || null, optionC || null, optionD || null, correctOption, points || 1, countRow.count)
+      .run();
+
+    return json({ message: "Question added.", id });
+  }
+
+  // ---------------- LIST QUESTIONS (with correct answers, for editing) ----------------
+  if (questionsMatch && request.method === "GET") {
+    const sessionCtx = await getSession(request, env);
+    if (!isTeachingStaff(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const testId = questionsMatch[1];
+    const { results } = await env.DB
+      .prepare("SELECT * FROM cbt_questions WHERE test_id = ? ORDER BY sort_order")
+      .bind(testId)
+      .all();
+
+    return json({ questions: results });
+  }
+
+  // ---------------- DELETE A QUESTION ----------------
+  const questionDeleteMatch = pathname.match(/^\/api\/cbt\/tests\/([^/]+)\/questions\/([^/]+)$/);
+  if (questionDeleteMatch && request.method === "DELETE") {
+    const sessionCtx = await getSession(request, env);
+    if (!isTeachingStaff(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const [, testId, questionId] = questionDeleteMatch;
+    const test = await env.DB.prepare("SELECT status FROM cbt_tests WHERE id = ?").bind(testId).first();
+    if (test && test.status === "published") return json({ error: "Unpublish the test before editing its questions." }, 400);
+
+    await env.DB.prepare("DELETE FROM cbt_questions WHERE id = ? AND test_id = ?").bind(questionId, testId).run();
+    return json({ message: "Question removed." });
+  }
+
+  // ---------------- RESULTS FOR A TEST (teaching staff) ----------------
+  const resultsMatch = pathname.match(/^\/api\/cbt\/tests\/([^/]+)\/results$/);
+  if (resultsMatch && request.method === "GET") {
+    const sessionCtx = await getSession(request, env);
+    if (!isTeachingStaff(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const testId = resultsMatch[1];
+    const { results } = await env.DB
+      .prepare(
+        `SELECT s.id, st.name AS student_name, st.admission_no, s.score, s.total_points, s.submitted_at
+         FROM cbt_submissions s
+         JOIN students st ON st.id = s.student_id
+         WHERE s.test_id = ?
+         ORDER BY s.score DESC`
+      )
+      .bind(testId)
+      .all();
+
+    return json({ results });
+  }
+
+  // ---------------- STUDENT: AVAILABLE TESTS ----------------
+  if (pathname === "/api/cbt/available" && request.method === "GET") {
+    const sessionCtx = await getSession(request, env);
+    if (!sessionCtx || sessionCtx.type !== "student") return json({ error: "Not authorised." }, 403);
+
+    const classId = sessionCtx.record.class_id;
+    const { results } = await env.DB
+      .prepare(
+        `SELECT t.id, t.title, t.duration_minutes, t.term, t.session, sub.name AS subject_name,
+                (SELECT COUNT(*) FROM cbt_questions q WHERE q.test_id = t.id) AS question_count,
+                sub2.score, sub2.total_points
+         FROM cbt_tests t
+         JOIN subjects sub ON sub.id = t.subject_id
+         LEFT JOIN cbt_submissions sub2 ON sub2.test_id = t.id AND sub2.student_id = ?
+         WHERE t.class_id = ? AND t.status = 'published'
+         ORDER BY t.created_at DESC`
+      )
+      .bind(sessionCtx.id, classId)
+      .all();
+
+    return json({
+      tests: results.map(r => ({
+        id: r.id, title: r.title, subjectName: r.subject_name, durationMinutes: r.duration_minutes,
+        term: r.term, session: r.session, questionCount: r.question_count,
+        submitted: r.score !== null, score: r.score, totalPoints: r.total_points
+      }))
+    });
+  }
+
+  // ---------------- STUDENT: TAKE A TEST ----------------
+  const takeMatch = pathname.match(/^\/api\/cbt\/tests\/([^/]+)\/take$/);
+  if (takeMatch && request.method === "GET") {
+    const sessionCtx = await getSession(request, env);
+    if (!sessionCtx || sessionCtx.type !== "student") return json({ error: "Not authorised." }, 403);
+
+    const testId = takeMatch[1];
+    const test = await env.DB.prepare("SELECT * FROM cbt_tests WHERE id = ? AND status = 'published'").bind(testId).first();
+    if (!test) return json({ error: "Test not found or not available." }, 404);
+    if (test.class_id !== sessionCtx.record.class_id) return json({ error: "This test is not for your class." }, 403);
+
+    const existing = await env.DB
+      .prepare("SELECT score, total_points FROM cbt_submissions WHERE test_id = ? AND student_id = ?")
+      .bind(testId, sessionCtx.id)
+      .first();
+    if (existing) return json({ error: "You have already submitted this test.", alreadySubmitted: true, score: existing.score, totalPoints: existing.total_points }, 409);
+
+    const { results: questions } = await env.DB
+      .prepare("SELECT id, question_text, type, option_a, option_b, option_c, option_d, points FROM cbt_questions WHERE test_id = ? ORDER BY sort_order")
+      .bind(testId)
+      .all();
+
+    return json({
+      test: { id: test.id, title: test.title, durationMinutes: test.duration_minutes },
+      questions
+    });
+  }
+
+  // ---------------- STUDENT: SUBMIT A TEST ----------------
+  const submitMatch = pathname.match(/^\/api\/cbt\/tests\/([^/]+)\/submit$/);
+  if (submitMatch && request.method === "POST") {
+    const sessionCtx = await getSession(request, env);
+    if (!sessionCtx || sessionCtx.type !== "student") return json({ error: "Not authorised." }, 403);
+
+    const testId = submitMatch[1];
+    const test = await env.DB.prepare("SELECT * FROM cbt_tests WHERE id = ? AND status = 'published'").bind(testId).first();
+    if (!test) return json({ error: "Test not found or not available." }, 404);
+    if (test.class_id !== sessionCtx.record.class_id) return json({ error: "This test is not for your class." }, 403);
+
+    const existing = await env.DB
+      .prepare("SELECT id FROM cbt_submissions WHERE test_id = ? AND student_id = ?")
+      .bind(testId, sessionCtx.id)
+      .first();
+    if (existing) return json({ error: "You have already submitted this test." }, 409);
+
+    const { answers } = await request.json();
+    if (!answers || typeof answers !== "object") return json({ error: "answers is required." }, 400);
+
+    const { results: questions } = await env.DB
+      .prepare("SELECT id, correct_option, points FROM cbt_questions WHERE test_id = ?")
+      .bind(testId)
+      .all();
+
+    let score = 0;
+    let totalPoints = 0;
+    for (const q of questions) {
+      totalPoints += q.points;
+      if (answers[q.id] !== undefined && String(answers[q.id]).toUpperCase() === String(q.correct_option).toUpperCase()) {
+        score += q.points;
+      }
+    }
+
+    const id = uuid();
+    await env.DB
+      .prepare(
+        `INSERT INTO cbt_submissions (id, test_id, student_id, answers_json, score, total_points, submitted_at)
+         VALUES (?, ?, ?, ?, ?, ?, datetime('now'))`
+      )
+      .bind(id, testId, sessionCtx.id, JSON.stringify(answers), score, totalPoints)
+      .run();
+
+    return json({ message: "Test submitted.", score, totalPoints });
+  }
+
+  return null; // not handled here — let the router try the next module
+}
+
+// =====================================================================
 // SECTION 7C: Results routes (score entry + admin approval)
 // =====================================================================
 /**
@@ -2257,6 +2569,7 @@ const modules = [
   handleManageAccountsRoutes,
   handleFeesRoutes,
   handleReportCardRoutes,
+  handleCbtRoutes,
   handleResultsRoutes
 ];
 
