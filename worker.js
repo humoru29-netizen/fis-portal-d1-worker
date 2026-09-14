@@ -2120,7 +2120,7 @@ async function handleCbtRoutes(request, env, url) {
 
     const { results } = await env.DB
       .prepare(
-        `SELECT t.id, t.title, t.duration_minutes, t.status, t.created_at, sub.name AS subject_name,
+        `SELECT t.id, t.title, t.duration_minutes, t.status, t.created_at, t.subject_id, sub.name AS subject_name,
                 (SELECT COUNT(*) FROM cbt_questions q WHERE q.test_id = t.id) AS question_count,
                 (SELECT COUNT(*) FROM cbt_submissions s WHERE s.test_id = t.id) AS submission_count
          FROM cbt_tests t
@@ -2188,7 +2188,7 @@ async function handleCbtRoutes(request, env, url) {
     if (!test) return json({ error: "Test not found." }, 404);
     if (test.status === "published") return json({ error: "Unpublish the test before editing its questions." }, 400);
 
-    const { questionText, type, optionA, optionB, optionC, optionD, correctOption, points } = await request.json();
+    const { questionText, type, optionA, optionB, optionC, optionD, correctOption, points, saveToBank } = await request.json();
     if (!questionText || !type || !correctOption) {
       return json({ error: "questionText, type, and correctOption are required." }, 400);
     }
@@ -2213,6 +2213,17 @@ async function handleCbtRoutes(request, env, url) {
       )
       .bind(id, testId, questionText, type, optionA || null, optionB || null, optionC || null, optionD || null, correctOption, points || 1, countRow.count)
       .run();
+
+    if (saveToBank) {
+      const testInfo = await env.DB.prepare("SELECT class_id, subject_id, term FROM cbt_tests WHERE id = ?").bind(testId).first();
+      await env.DB
+        .prepare(
+          `INSERT INTO cbt_question_bank (id, class_id, subject_id, term, question_text, type, option_a, option_b, option_c, option_d, correct_option, points, created_by, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))`
+        )
+        .bind(uuid(), testInfo.class_id, testInfo.subject_id, testInfo.term, questionText, type, optionA || null, optionB || null, optionC || null, optionD || null, correctOption, points || 1, sessionCtx.id)
+        .run();
+    }
 
     return json({ message: "Question added.", id });
   }
@@ -2243,6 +2254,109 @@ async function handleCbtRoutes(request, env, url) {
 
     await env.DB.prepare("DELETE FROM cbt_questions WHERE id = ? AND test_id = ?").bind(questionId, testId).run();
     return json({ message: "Question removed." });
+  }
+
+  // ---------------- QUESTION BANK: ADD ----------------
+  if (pathname === "/api/cbt/question-bank" && request.method === "POST") {
+    const sessionCtx = await getSession(request, env);
+    if (!isTeachingStaff(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const { classId, subjectId, term, questionText, type, optionA, optionB, optionC, optionD, correctOption, points } = await request.json();
+    if (!classId || !subjectId || !term || !questionText || !type || !correctOption) {
+      return json({ error: "classId, subjectId, term, questionText, type, and correctOption are required." }, 400);
+    }
+    if (!["mcq", "true_false"].includes(type)) return json({ error: "type must be 'mcq' or 'true_false'." }, 400);
+    if (type === "mcq" && (!optionA || !optionB)) {
+      return json({ error: "MCQ questions need at least optionA and optionB." }, 400);
+    }
+    if (type === "true_false" && !["true", "false"].includes(correctOption)) {
+      return json({ error: "For true_false questions, correctOption must be 'true' or 'false'." }, 400);
+    }
+    if (type === "mcq" && !["A", "B", "C", "D"].includes(correctOption)) {
+      return json({ error: "For mcq questions, correctOption must be 'A', 'B', 'C', or 'D'." }, 400);
+    }
+
+    const id = uuid();
+    await env.DB
+      .prepare(
+        `INSERT INTO cbt_question_bank (id, class_id, subject_id, term, question_text, type, option_a, option_b, option_c, option_d, correct_option, points, created_by, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))`
+      )
+      .bind(id, classId, subjectId, term, questionText, type, optionA || null, optionB || null, optionC || null, optionD || null, correctOption, points || 1, sessionCtx.id)
+      .run();
+
+    return json({ message: "Added to question bank.", id });
+  }
+
+  // ---------------- QUESTION BANK: LIST ----------------
+  if (pathname === "/api/cbt/question-bank" && request.method === "GET") {
+    const sessionCtx = await getSession(request, env);
+    if (!isTeachingStaff(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const classId = url.searchParams.get("classId");
+    const subjectId = url.searchParams.get("subjectId");
+    const term = url.searchParams.get("term");
+    if (!classId || !subjectId || !term) return json({ error: "classId, subjectId, and term are required." }, 400);
+
+    const { results } = await env.DB
+      .prepare(
+        `SELECT * FROM cbt_question_bank
+         WHERE class_id = ? AND subject_id = ? AND term = ?
+         ORDER BY created_at DESC`
+      )
+      .bind(classId, subjectId, term)
+      .all();
+
+    return json({ questions: results });
+  }
+
+  // ---------------- QUESTION BANK: DELETE ----------------
+  const bankDeleteMatch = pathname.match(/^\/api\/cbt\/question-bank\/([^/]+)$/);
+  if (bankDeleteMatch && request.method === "DELETE") {
+    const sessionCtx = await getSession(request, env);
+    if (!isTeachingStaff(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    await env.DB.prepare("DELETE FROM cbt_question_bank WHERE id = ?").bind(bankDeleteMatch[1]).run();
+    return json({ message: "Removed from question bank." });
+  }
+
+  // ---------------- ADD QUESTIONS TO A TEST FROM THE BANK ----------------
+  const fromBankMatch = pathname.match(/^\/api\/cbt\/tests\/([^/]+)\/questions\/from-bank$/);
+  if (fromBankMatch && request.method === "POST") {
+    const sessionCtx = await getSession(request, env);
+    if (!isTeachingStaff(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const testId = fromBankMatch[1];
+    const test = await env.DB.prepare("SELECT id, status FROM cbt_tests WHERE id = ?").bind(testId).first();
+    if (!test) return json({ error: "Test not found." }, 404);
+    if (test.status === "published") return json({ error: "Unpublish the test before editing its questions." }, 400);
+
+    const { questionBankIds } = await request.json();
+    if (!Array.isArray(questionBankIds) || !questionBankIds.length) {
+      return json({ error: "questionBankIds must be a non-empty array." }, 400);
+    }
+
+    const countRow = await env.DB.prepare("SELECT COUNT(*) AS count FROM cbt_questions WHERE test_id = ?").bind(testId).first();
+    let nextOrder = countRow.count;
+    let added = 0;
+
+    for (const bankId of questionBankIds) {
+      const bq = await env.DB.prepare("SELECT * FROM cbt_question_bank WHERE id = ?").bind(bankId).first();
+      if (!bq) continue;
+
+      await env.DB
+        .prepare(
+          `INSERT INTO cbt_questions (id, test_id, question_text, type, option_a, option_b, option_c, option_d, correct_option, points, sort_order)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        )
+        .bind(uuid(), testId, bq.question_text, bq.type, bq.option_a, bq.option_b, bq.option_c, bq.option_d, bq.correct_option, bq.points, nextOrder)
+        .run();
+
+      nextOrder++;
+      added++;
+    }
+
+    return json({ message: added + " question(s) added from the bank.", added });
   }
 
   // ---------------- RESULTS FOR A TEST (teaching staff) ----------------
