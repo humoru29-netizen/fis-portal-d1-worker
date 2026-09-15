@@ -2713,8 +2713,17 @@ export default {
         }
       }
     } catch (err) {
-      return new Response(JSON.stringify({ error: "Internal error: " + err.message }), {
-        status: 500,
+      const message = String(err && err.message || err);
+      let friendly = "Something went wrong while saving. Please try again.";
+
+      if (message.includes("FOREIGN KEY")) {
+        friendly = "Could not save — your account, or one of the records you selected (class, subject, or student), could not be verified. Please log out and log back in, then try again.";
+      } else if (message.includes("UNIQUE")) {
+        friendly = "That already exists — please check for a duplicate entry.";
+      }
+
+      return new Response(JSON.stringify({ error: friendly, detail: message }), {
+        status: message.includes("FOREIGN KEY") ? 409 : 500,
         headers: { "Content-Type": "application/json", ...corsHeaders() }
       });
     }
