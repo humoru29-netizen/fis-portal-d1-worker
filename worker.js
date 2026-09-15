@@ -2487,6 +2487,110 @@ async function handleCbtRoutes(request, env, url) {
 }
 
 // =====================================================================
+// SECTION 7I: Announcements routes (admin posts, staff/students see a
+// feed filtered to what's relevant to them)
+// =====================================================================
+/**
+ * Routes:
+ *   POST   /api/announcements        (auth: admin) { title, body, audience }
+ *   GET    /api/announcements        (auth: any logged-in) personalised feed
+ *   GET    /api/announcements/all    (auth: admin) full unfiltered list, for management
+ *   DELETE /api/announcements/:id    (auth: admin)
+ *
+ * `audience` is one of: 'all', 'staff', 'teachers', 'students',
+ * 'primary', 'secondary', or 'class_<classId>'.
+ */
+function announcementMatchesSession(audience, sessionCtx) {
+  if (audience === "all") return true;
+
+  if (sessionCtx.type === "staff") {
+    if (isAdminSession(sessionCtx)) return true; // admins see everything
+    if (audience === "staff") return true;
+    if (audience === "teachers" && sessionCtx.role === "teacher") return true;
+    if ((audience === "primary" || audience === "secondary") && sessionCtx.level === audience) return true;
+    return false; // class_<id> announcements aren't shown to staff in this feed
+  }
+
+  if (sessionCtx.type === "student") {
+    if (audience === "students") return true;
+    if ((audience === "primary" || audience === "secondary") && sessionCtx.record.level === audience) return true;
+    if (audience === "class_" + sessionCtx.record.class_id) return true;
+    return false;
+  }
+
+  return false;
+}
+
+async function handleAnnouncementRoutes(request, env, url) {
+  const { pathname } = url;
+
+  // ---------------- POST AN ANNOUNCEMENT ----------------
+  if (pathname === "/api/announcements" && request.method === "POST") {
+    const sessionCtx = await getSession(request, env);
+    if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const { title, body, audience } = await request.json();
+    if (!title || !body || !audience) {
+      return json({ error: "title, body, and audience are required." }, 400);
+    }
+    const validPrefixes = ["all", "staff", "teachers", "students", "primary", "secondary"];
+    if (!validPrefixes.includes(audience) && !audience.startsWith("class_")) {
+      return json({ error: "Invalid audience." }, 400);
+    }
+
+    const id = uuid();
+    await env.DB
+      .prepare("INSERT INTO announcements (id, title, body, audience, created_by, created_at) VALUES (?, ?, ?, ?, ?, datetime('now'))")
+      .bind(id, title, body, audience, sessionCtx.id)
+      .run();
+
+    return json({ message: "Announcement posted.", id });
+  }
+
+  // ---------------- PERSONALISED FEED ----------------
+  if (pathname === "/api/announcements" && request.method === "GET") {
+    const sessionCtx = await getSession(request, env);
+    if (!sessionCtx) return json({ error: "Not authenticated." }, 401);
+
+    const { results } = await env.DB
+      .prepare("SELECT id, title, body, audience, created_at FROM announcements ORDER BY created_at DESC LIMIT 100")
+      .all();
+
+    const feed = results.filter(a => announcementMatchesSession(a.audience, sessionCtx));
+    return json({ announcements: feed });
+  }
+
+  // ---------------- FULL LIST (admin management) ----------------
+  if (pathname === "/api/announcements/all" && request.method === "GET") {
+    const sessionCtx = await getSession(request, env);
+    if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const { results } = await env.DB
+      .prepare(
+        `SELECT a.id, a.title, a.body, a.audience, a.created_at, u.name AS created_by_name
+         FROM announcements a
+         LEFT JOIN users u ON u.id = a.created_by
+         ORDER BY a.created_at DESC LIMIT 200`
+      )
+      .all();
+
+    return json({ announcements: results });
+  }
+
+  // ---------------- DELETE ----------------
+  const deleteMatch = pathname.match(/^\/api\/announcements\/([^/]+)$/);
+  if (deleteMatch && request.method === "DELETE") {
+    const sessionCtx = await getSession(request, env);
+    if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    await env.DB.prepare("DELETE FROM announcements WHERE id = ?").bind(deleteMatch[1]).run();
+    return json({ message: "Announcement deleted." });
+  }
+
+  return null; // not handled here — let the router try the next module
+}
+
+// =====================================================================
 // SECTION 7C: Results routes (score entry + admin approval)
 // =====================================================================
 /**
@@ -2684,6 +2788,7 @@ const modules = [
   handleFeesRoutes,
   handleReportCardRoutes,
   handleCbtRoutes,
+  handleAnnouncementRoutes,
   handleResultsRoutes
 ];
 
