@@ -253,6 +253,20 @@ function isOwnStudent(session, studentId) {
   return !!session && session.type === "student" && session.id === studentId;
 }
 
+/**
+ * Returns 'primary' or 'secondary' if this session belongs to a level-scoped
+ * admin (primary_admin / secondary_admin), or null if unrestricted
+ * (general_admin, or not an admin at all). Every route that touches a
+ * specific class, student, staff member, or level-tagged record should
+ * check this and reject/filter anything outside the admin's own level.
+ */
+function adminLevelRestriction(session) {
+  if (!isStaff(session)) return null;
+  if (session.role === "primary_admin") return "primary";
+  if (session.role === "secondary_admin") return "secondary";
+  return null;
+}
+
 // =====================================================================
 // SECTION 4: Auth & account approval routes
 // =====================================================================
@@ -377,7 +391,8 @@ async function handleAuthRoutes(request, env, url) {
     const sessionCtx = await getSession(request, env);
     if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
 
-    const level = url.searchParams.get("level");
+    const restriction = adminLevelRestriction(sessionCtx);
+    const level = restriction || url.searchParams.get("level");
     const stmt = level
       ? env.DB.prepare("SELECT id, name, email, requested_role, requested_level, created_at FROM users WHERE status = 'pending' AND requested_level = ?").bind(level)
       : env.DB.prepare("SELECT id, name, email, requested_role, requested_level, created_at FROM users WHERE status = 'pending'");
@@ -401,8 +416,19 @@ async function handleAuthRoutes(request, env, url) {
       .first();
     if (!target) return json({ error: "Request not found or already handled." }, 404);
 
+    const restriction = adminLevelRestriction(sessionCtx);
+    if (restriction && target.requested_level !== restriction) {
+      return json({ error: "Not authorised for this request." }, 403);
+    }
+    if (restriction && action === "approve" && level && level !== restriction) {
+      return json({ error: `As a ${restriction} admin, you can only approve at ${restriction} level.` }, 403);
+    }
+
     if (action === "approve") {
       if (!role) return json({ error: "Approved role is required." }, 400);
+      if (restriction && ["general_admin", restriction === "primary" ? "secondary_admin" : "primary_admin"].includes(role)) {
+        return json({ error: "Not authorised to assign that role." }, 403);
+      }
       await env.DB
         .prepare(
           `UPDATE users SET status = 'active', role = ?, level = ?, approved_by = ?, approved_at = datetime('now')
@@ -547,6 +573,12 @@ async function handleAttendanceRoutes(request, env, url) {
         }
       }
 
+      const restriction = adminLevelRestriction(sessionCtx);
+      if (restriction) {
+        const cls = await env.DB.prepare("SELECT level FROM classes WHERE id = ?").bind(classId).first();
+        if (!cls || cls.level !== restriction) return json({ error: "Not authorised for this class." }, 403);
+      }
+
       // Upsert each record — one row per student per date (see UNIQUE constraint)
       const statements = records.map(r =>
         env.DB.prepare(
@@ -572,6 +604,12 @@ async function handleAttendanceRoutes(request, env, url) {
       const date = url.searchParams.get("date");
       if (!classId || !date) return json({ error: "classId and date are required." }, 400);
 
+      const restriction = adminLevelRestriction(sessionCtx);
+      if (restriction) {
+        const cls = await env.DB.prepare("SELECT level FROM classes WHERE id = ?").bind(classId).first();
+        if (!cls || cls.level !== restriction) return json({ error: "Not authorised for this class." }, 403);
+      }
+
       const { results } = await env.DB
         .prepare(
           `SELECT a.student_id, s.name AS student_name, a.status
@@ -596,6 +634,12 @@ async function handleAttendanceRoutes(request, env, url) {
       // Staff can view any student; a student session can only view its own record.
       if (!isTeachingStaff(sessionCtx) && !isOwnStudent(sessionCtx, studentId)) {
         return json({ error: "Not authorised." }, 403);
+      }
+
+      const restriction = adminLevelRestriction(sessionCtx);
+      if (restriction) {
+        const stu = await env.DB.prepare("SELECT level FROM students WHERE id = ?").bind(studentId).first();
+        if (!stu || stu.level !== restriction) return json({ error: "Not authorised for this student." }, 403);
       }
 
       const term = url.searchParams.get("term");
@@ -629,6 +673,12 @@ async function handleAttendanceRoutes(request, env, url) {
       const session = url.searchParams.get("session");
       if (!classId || !term || !session) {
         return json({ error: "classId, term, and session are required." }, 400);
+      }
+
+      const restriction = adminLevelRestriction(sessionCtx);
+      if (restriction) {
+        const cls = await env.DB.prepare("SELECT level FROM classes WHERE id = ?").bind(classId).first();
+        if (!cls || cls.level !== restriction) return json({ error: "Not authorised for this class." }, 403);
       }
 
       const { results } = await env.DB
@@ -686,6 +736,12 @@ async function handleAssignmentRoutes(request, env, url) {
     const { title, description, classId, subjectId, dueDate, term, session } = await request.json();
     if (!title || !classId || !subjectId || !dueDate || !term || !session) {
       return json({ error: "title, classId, subjectId, dueDate, term, and session are required." }, 400);
+    }
+
+    const restriction = adminLevelRestriction(sessionCtx);
+    if (restriction) {
+      const cls = await env.DB.prepare("SELECT level FROM classes WHERE id = ?").bind(classId).first();
+      if (!cls || cls.level !== restriction) return json({ error: "Not authorised for this class." }, 403);
     }
 
     const id = uuid();
@@ -812,6 +868,12 @@ async function handleAssignmentRoutes(request, env, url) {
       .first();
     if (!assignment) return json({ error: "Assignment not found." }, 404);
 
+    const restriction = adminLevelRestriction(sessionCtx);
+    if (restriction) {
+      const cls = await env.DB.prepare("SELECT level FROM classes WHERE id = ?").bind(assignment.class_id).first();
+      if (!cls || cls.level !== restriction) return json({ error: "Not authorised for this assignment." }, 403);
+    }
+
     const { results } = await env.DB
       .prepare(
         `SELECT s.id AS student_id, s.name,
@@ -839,6 +901,15 @@ async function handleAssignmentRoutes(request, env, url) {
     const { status, remark } = await request.json();
     if (status && !SUBMISSION_STATUSES.includes(status)) {
       return json({ error: "Invalid status." }, 400);
+    }
+
+    const restriction = adminLevelRestriction(sessionCtx);
+    if (restriction) {
+      const row = await env.DB
+        .prepare(`SELECT c.level FROM assignments a JOIN classes c ON c.id = a.class_id WHERE a.id = ?`)
+        .bind(assignmentId)
+        .first();
+      if (!row || row.level !== restriction) return json({ error: "Not authorised for this assignment." }, 403);
     }
 
     const existing = await env.DB
@@ -963,7 +1034,8 @@ async function handleRosterRoutes(request, env, url) {
     const sessionCtx = await getSession(request, env);
     if (!isTeachingStaff(sessionCtx)) return json({ error: "Not authorised." }, 403);
 
-    const level = url.searchParams.get("level");
+    const restriction = adminLevelRestriction(sessionCtx);
+    const level = restriction || url.searchParams.get("level");
     const stmt = level
       ? env.DB.prepare("SELECT * FROM classes WHERE level = ? ORDER BY sort_order, name").bind(level)
       : env.DB.prepare("SELECT * FROM classes ORDER BY level, sort_order, name");
@@ -981,6 +1053,10 @@ async function handleRosterRoutes(request, env, url) {
     if (!name || !level) {
       return json({ error: "name and level are required." }, 400);
     }
+    const restriction = adminLevelRestriction(sessionCtx);
+    if (restriction && level !== restriction) {
+      return json({ error: `As a ${restriction} admin, you can only create ${restriction} classes.` }, 403);
+    }
 
     const id = uuid();
     await env.DB
@@ -996,10 +1072,22 @@ async function handleRosterRoutes(request, env, url) {
     const sessionCtx = await getSession(request, env);
     if (!isTeachingStaff(sessionCtx)) return json({ error: "Not authorised." }, 403);
 
+    const restriction = adminLevelRestriction(sessionCtx);
     const classId = url.searchParams.get("classId");
-    const stmt = classId
-      ? env.DB.prepare("SELECT * FROM students WHERE class_id = ? AND status = 'active' ORDER BY name").bind(classId)
-      : env.DB.prepare("SELECT * FROM students WHERE status = 'active' ORDER BY name");
+
+    if (classId && restriction) {
+      const cls = await env.DB.prepare("SELECT level FROM classes WHERE id = ?").bind(classId).first();
+      if (!cls || cls.level !== restriction) return json({ error: "Not authorised for this class." }, 403);
+    }
+
+    let stmt;
+    if (classId) {
+      stmt = env.DB.prepare("SELECT * FROM students WHERE class_id = ? AND status = 'active' ORDER BY name").bind(classId);
+    } else if (restriction) {
+      stmt = env.DB.prepare("SELECT * FROM students WHERE status = 'active' AND level = ? ORDER BY name").bind(restriction);
+    } else {
+      stmt = env.DB.prepare("SELECT * FROM students WHERE status = 'active' ORDER BY name");
+    }
 
     const { results } = await stmt.all();
     return json({ students: results });
@@ -1013,6 +1101,10 @@ async function handleRosterRoutes(request, env, url) {
     const { name, classId, level, sessionJoined, guardianName, guardianPhone } = await request.json();
     if (!name || !classId || !level) {
       return json({ error: "name, classId, and level are required." }, 400);
+    }
+    const restriction = adminLevelRestriction(sessionCtx);
+    if (restriction && level !== restriction) {
+      return json({ error: `As a ${restriction} admin, you can only add ${restriction} students.` }, 403);
     }
 
     const admissionNo = await generateAdmissionNo(env);
@@ -1041,10 +1133,15 @@ async function handleRosterRoutes(request, env, url) {
     }
 
     const student = await env.DB
-      .prepare("SELECT id FROM students WHERE id = ? AND status = 'active'")
+      .prepare("SELECT id, level FROM students WHERE id = ? AND status = 'active'")
       .bind(studentId)
       .first();
     if (!student) return json({ error: "Student not found." }, 404);
+
+    const restriction = adminLevelRestriction(sessionCtx);
+    if (restriction && student.level !== restriction) {
+      return json({ error: "Not authorised for this student." }, 403);
+    }
 
     const pin = generatePin();
     const pinHash = await hash(pin);
@@ -1080,7 +1177,8 @@ async function handleRosterRoutes(request, env, url) {
     const sessionCtx = await getSession(request, env);
     if (!isTeachingStaff(sessionCtx)) return json({ error: "Not authorised." }, 403);
 
-    const level = url.searchParams.get("level");
+    const restriction = adminLevelRestriction(sessionCtx);
+    const level = restriction || url.searchParams.get("level");
     const stmt = level
       ? env.DB.prepare("SELECT * FROM subjects WHERE level = ? ORDER BY name").bind(level)
       : env.DB.prepare("SELECT * FROM subjects ORDER BY level, name");
@@ -1097,6 +1195,10 @@ async function handleRosterRoutes(request, env, url) {
     const { name, level } = await request.json();
     if (!name || !level) {
       return json({ error: "name and level are required." }, 400);
+    }
+    const restriction = adminLevelRestriction(sessionCtx);
+    if (restriction && level !== restriction) {
+      return json({ error: `As a ${restriction} admin, you can only create ${restriction} subjects.` }, 403);
     }
 
     const id = uuid();
@@ -1115,6 +1217,12 @@ async function handleRosterRoutes(request, env, url) {
     if (!isTeachingStaff(sessionCtx)) return json({ error: "Not authorised." }, 403);
 
     const classId = classSubjectsMatch[1];
+    const restriction = adminLevelRestriction(sessionCtx);
+    if (restriction) {
+      const cls = await env.DB.prepare("SELECT level FROM classes WHERE id = ?").bind(classId).first();
+      if (!cls || cls.level !== restriction) return json({ error: "Not authorised for this class." }, 403);
+    }
+
     const { results } = await env.DB
       .prepare(
         `SELECT s.id, s.name, s.level
@@ -1138,6 +1246,12 @@ async function handleRosterRoutes(request, env, url) {
     const { subjectId } = await request.json();
     if (!subjectId) return json({ error: "subjectId is required." }, 400);
 
+    const restriction = adminLevelRestriction(sessionCtx);
+    if (restriction) {
+      const cls = await env.DB.prepare("SELECT level FROM classes WHERE id = ?").bind(classId).first();
+      if (!cls || cls.level !== restriction) return json({ error: "Not authorised for this class." }, 403);
+    }
+
     await env.DB
       .prepare("INSERT OR IGNORE INTO class_subjects (class_id, subject_id) VALUES (?, ?)")
       .bind(classId, subjectId)
@@ -1153,6 +1267,12 @@ async function handleRosterRoutes(request, env, url) {
     if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
 
     const [, classId, subjectId] = unassignMatch;
+    const restriction = adminLevelRestriction(sessionCtx);
+    if (restriction) {
+      const cls = await env.DB.prepare("SELECT level FROM classes WHERE id = ?").bind(classId).first();
+      if (!cls || cls.level !== restriction) return json({ error: "Not authorised for this class." }, 403);
+    }
+
     await env.DB
       .prepare("DELETE FROM class_subjects WHERE class_id = ? AND subject_id = ?")
       .bind(classId, subjectId)
@@ -1172,6 +1292,12 @@ async function handleRosterRoutes(request, env, url) {
     const session = url.searchParams.get("session");
     if (!term || !session) {
       return json({ error: "term and session are required." }, 400);
+    }
+
+    const restriction = adminLevelRestriction(sessionCtx);
+    if (restriction) {
+      const cls = await env.DB.prepare("SELECT level FROM classes WHERE id = ?").bind(classId).first();
+      if (!cls || cls.level !== restriction) return json({ error: "Not authorised for this class." }, 403);
     }
 
     const { results } = await env.DB
@@ -1197,6 +1323,12 @@ async function handleRosterRoutes(request, env, url) {
     if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
 
     const classId = classDetailMatch[1];
+    const restriction = adminLevelRestriction(sessionCtx);
+    if (restriction) {
+      const cls = await env.DB.prepare("SELECT level FROM classes WHERE id = ?").bind(classId).first();
+      if (!cls || cls.level !== restriction) return json({ error: "Not authorised for this class." }, 403);
+    }
+
     const studentCount = await env.DB
       .prepare("SELECT COUNT(*) AS count FROM students WHERE class_id = ? AND status = 'active'")
       .bind(classId)
@@ -1218,6 +1350,12 @@ async function handleRosterRoutes(request, env, url) {
     if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
 
     const subjectId = subjectDetailMatch[1];
+    const restriction = adminLevelRestriction(sessionCtx);
+    if (restriction) {
+      const subj = await env.DB.prepare("SELECT level FROM subjects WHERE id = ?").bind(subjectId).first();
+      if (!subj || subj.level !== restriction) return json({ error: "Not authorised for this subject." }, 403);
+    }
+
     await env.DB.prepare("DELETE FROM class_subjects WHERE subject_id = ?").bind(subjectId).run();
     await env.DB.prepare("DELETE FROM subjects WHERE id = ?").bind(subjectId).run();
 
@@ -1232,10 +1370,15 @@ async function handleRosterRoutes(request, env, url) {
 
     const studentId = studentDetailMatch[1];
     const student = await env.DB
-      .prepare("SELECT id FROM students WHERE id = ? AND status = 'active'")
+      .prepare("SELECT id, level FROM students WHERE id = ? AND status = 'active'")
       .bind(studentId)
       .first();
     if (!student) return json({ error: "Student not found." }, 404);
+
+    const restriction = adminLevelRestriction(sessionCtx);
+    if (restriction && student.level !== restriction) {
+      return json({ error: "Not authorised for this student." }, 403);
+    }
 
     await env.DB
       .prepare("UPDATE students SET status = 'inactive' WHERE id = ?")
@@ -1267,10 +1410,12 @@ async function handleTeacherAssignmentRoutes(request, env, url) {
     const sessionCtx = await getSession(request, env);
     if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
 
-    const { results } = await env.DB
-      .prepare("SELECT id, name, email, level FROM users WHERE role = 'teacher' AND status = 'active' ORDER BY name")
-      .all();
+    const restriction = adminLevelRestriction(sessionCtx);
+    const stmt = restriction
+      ? env.DB.prepare("SELECT id, name, email, level FROM users WHERE role = 'teacher' AND status = 'active' AND level = ? ORDER BY name").bind(restriction)
+      : env.DB.prepare("SELECT id, name, email, level FROM users WHERE role = 'teacher' AND status = 'active' ORDER BY name");
 
+    const { results } = await stmt.all();
     return json({ teachers: results });
   }
 
@@ -1284,11 +1429,20 @@ async function handleTeacherAssignmentRoutes(request, env, url) {
       return json({ error: "teacherId, classId, and subjectId are required." }, 400);
     }
 
+    const restriction = adminLevelRestriction(sessionCtx);
+    if (restriction) {
+      const cls = await env.DB.prepare("SELECT level FROM classes WHERE id = ?").bind(classId).first();
+      if (!cls || cls.level !== restriction) return json({ error: "Not authorised for this class." }, 403);
+    }
+
     const teacher = await env.DB
-      .prepare("SELECT id FROM users WHERE id = ? AND role = 'teacher' AND status = 'active'")
+      .prepare("SELECT id, level FROM users WHERE id = ? AND role = 'teacher' AND status = 'active'")
       .bind(teacherId)
       .first();
     if (!teacher) return json({ error: "Teacher not found." }, 404);
+    if (restriction && teacher.level !== restriction) {
+      return json({ error: "Not authorised for this teacher." }, 403);
+    }
 
     const validPair = await env.DB
       .prepare("SELECT 1 FROM class_subjects WHERE class_id = ? AND subject_id = ?")
@@ -1322,6 +1476,7 @@ async function handleTeacherAssignmentRoutes(request, env, url) {
 
     const teacherId = url.searchParams.get("teacherId");
     const classId = url.searchParams.get("classId");
+    const restriction = adminLevelRestriction(sessionCtx);
 
     let query = `
       SELECT ta.id, ta.teacher_id, u.name AS teacher_name,
@@ -1336,6 +1491,7 @@ async function handleTeacherAssignmentRoutes(request, env, url) {
     const params = [];
     if (teacherId) { conditions.push("ta.teacher_id = ?"); params.push(teacherId); }
     if (classId) { conditions.push("ta.class_id = ?"); params.push(classId); }
+    if (restriction) { conditions.push("c.level = ?"); params.push(restriction); }
     if (conditions.length) query += " WHERE " + conditions.join(" AND ");
     query += " ORDER BY c.sort_order, s.name";
 
@@ -1350,6 +1506,17 @@ async function handleTeacherAssignmentRoutes(request, env, url) {
     if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
 
     const assignmentId = assignmentDetailMatch[1];
+    const restriction = adminLevelRestriction(sessionCtx);
+    if (restriction) {
+      const row = await env.DB
+        .prepare(
+          `SELECT c.level FROM teacher_assignments ta JOIN classes c ON c.id = ta.class_id WHERE ta.id = ?`
+        )
+        .bind(assignmentId)
+        .first();
+      if (!row || row.level !== restriction) return json({ error: "Not authorised for this assignment." }, 403);
+    }
+
     await env.DB.prepare("DELETE FROM teacher_assignments WHERE id = ?").bind(assignmentId).run();
 
     return json({ message: "Assignment removed." });
@@ -1409,7 +1576,8 @@ async function handleAdmissionRoutes(request, env, url) {
     if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
 
     const status = url.searchParams.get("status") || "pending";
-    const level = url.searchParams.get("level");
+    const restriction = adminLevelRestriction(sessionCtx);
+    const level = restriction || url.searchParams.get("level");
 
     let query = `
       SELECT aa.id, aa.student_name, aa.dob, aa.gender, aa.level_applied, aa.class_applied,
@@ -1447,6 +1615,11 @@ async function handleAdmissionRoutes(request, env, url) {
       .first();
     if (!application) return json({ error: "Pending application not found." }, 404);
 
+    const restriction = adminLevelRestriction(sessionCtx);
+    if (restriction && application.level_applied !== restriction) {
+      return json({ error: "Not authorised for this application." }, 403);
+    }
+
     if (action === "reject") {
       await env.DB
         .prepare(
@@ -1467,6 +1640,9 @@ async function handleAdmissionRoutes(request, env, url) {
       .bind(classId)
       .first();
     if (!targetClass) return json({ error: "Class not found." }, 404);
+    if (restriction && targetClass.level !== restriction) {
+      return json({ error: "Not authorised for this class." }, 403);
+    }
 
     const admissionNo = await generateAdmissionNo(env);
     const studentId = uuid();
@@ -1525,15 +1701,18 @@ async function handleManageAccountsRoutes(request, env, url) {
     const sessionCtx = await getSession(request, env);
     if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
 
-    const { results } = await env.DB
-      .prepare(
-        `SELECT id, name, email, role, level, status, created_at, approved_by, approved_at
-         FROM users
-         WHERE status IN ('active', 'suspended')
-         ORDER BY name`
-      )
-      .all();
+    const restriction = adminLevelRestriction(sessionCtx);
+    const stmt = restriction
+      ? env.DB.prepare(
+          `SELECT id, name, email, role, level, status, created_at, approved_by, approved_at
+           FROM users WHERE status IN ('active', 'suspended') AND level = ? ORDER BY name`
+        ).bind(restriction)
+      : env.DB.prepare(
+          `SELECT id, name, email, role, level, status, created_at, approved_by, approved_at
+           FROM users WHERE status IN ('active', 'suspended') ORDER BY name`
+        );
 
+    const { results } = await stmt.all();
     return json({ staff: results });
   }
 
@@ -1550,8 +1729,17 @@ async function handleManageAccountsRoutes(request, env, url) {
       return json({ error: "Invalid role." }, 400);
     }
 
-    const target = await env.DB.prepare("SELECT id FROM users WHERE id = ?").bind(staffId).first();
+    const target = await env.DB.prepare("SELECT id, level FROM users WHERE id = ?").bind(staffId).first();
     if (!target) return json({ error: "Account not found." }, 404);
+
+    const restriction = adminLevelRestriction(sessionCtx);
+    if (restriction) {
+      if (target.level !== restriction) return json({ error: "Not authorised for this account." }, 403);
+      if (level !== restriction) return json({ error: `As a ${restriction} admin, you can only set ${restriction}-level accounts.` }, 403);
+      if (["general_admin", restriction === "primary" ? "secondary_admin" : "primary_admin"].includes(role)) {
+        return json({ error: "Not authorised to assign that role." }, 403);
+      }
+    }
 
     await env.DB
       .prepare("UPDATE users SET role = ?, level = ? WHERE id = ?")
@@ -1577,8 +1765,13 @@ async function handleManageAccountsRoutes(request, env, url) {
       return json({ error: "You can't suspend your own account." }, 400);
     }
 
-    const target = await env.DB.prepare("SELECT id FROM users WHERE id = ?").bind(staffId).first();
+    const target = await env.DB.prepare("SELECT id, level FROM users WHERE id = ?").bind(staffId).first();
     if (!target) return json({ error: "Account not found." }, 404);
+
+    const restriction = adminLevelRestriction(sessionCtx);
+    if (restriction && target.level !== restriction) {
+      return json({ error: "Not authorised for this account." }, 403);
+    }
 
     await env.DB.prepare("UPDATE users SET status = ? WHERE id = ?").bind(status, staffId).run();
 
@@ -1592,8 +1785,13 @@ async function handleManageAccountsRoutes(request, env, url) {
     if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
 
     const staffId = resetMatch[1];
-    const target = await env.DB.prepare("SELECT id FROM users WHERE id = ?").bind(staffId).first();
+    const target = await env.DB.prepare("SELECT id, level FROM users WHERE id = ?").bind(staffId).first();
     if (!target) return json({ error: "Account not found." }, 404);
+
+    const restriction = adminLevelRestriction(sessionCtx);
+    if (restriction && target.level !== restriction) {
+      return json({ error: "Not authorised for this account." }, 403);
+    }
 
     const tempPassword = generateTempPassword();
     const passwordHash = await hash(tempPassword);
@@ -1612,6 +1810,12 @@ async function handleManageAccountsRoutes(request, env, url) {
     const staffId = deleteMatch[1];
     if (staffId === sessionCtx.id) {
       return json({ error: "You can't delete your own account." }, 400);
+    }
+
+    const restriction = adminLevelRestriction(sessionCtx);
+    if (restriction) {
+      const target = await env.DB.prepare("SELECT level FROM users WHERE id = ?").bind(staffId).first();
+      if (!target || target.level !== restriction) return json({ error: "Not authorised for this account." }, 403);
     }
 
     await env.DB.prepare("DELETE FROM users WHERE id = ?").bind(staffId).run();
@@ -1655,6 +1859,12 @@ async function handleFeesRoutes(request, env, url) {
       return json({ error: "amount must be a non-negative number." }, 400);
     }
 
+    const restriction = adminLevelRestriction(sessionCtx);
+    if (restriction) {
+      const cls = await env.DB.prepare("SELECT level FROM classes WHERE id = ?").bind(classId).first();
+      if (!cls || cls.level !== restriction) return json({ error: "Not authorised for this class." }, 403);
+    }
+
     const existing = await env.DB
       .prepare("SELECT id FROM fee_structures WHERE class_id = ? AND term = ? AND session = ?")
       .bind(classId, term, session)
@@ -1681,16 +1891,23 @@ async function handleFeesRoutes(request, env, url) {
     const session = url.searchParams.get("session");
     if (!term || !session) return json({ error: "term and session are required." }, 400);
 
-    const { results } = await env.DB
-      .prepare(
-        `SELECT c.id AS class_id, c.name AS class_name, fs.amount
-         FROM classes c
-         LEFT JOIN fee_structures fs ON fs.class_id = c.id AND fs.term = ? AND fs.session = ?
-         ORDER BY c.sort_order`
-      )
-      .bind(term, session)
-      .all();
+    const restriction = adminLevelRestriction(sessionCtx);
+    const stmt = restriction
+      ? env.DB.prepare(
+          `SELECT c.id AS class_id, c.name AS class_name, fs.amount
+           FROM classes c
+           LEFT JOIN fee_structures fs ON fs.class_id = c.id AND fs.term = ? AND fs.session = ?
+           WHERE c.level = ?
+           ORDER BY c.sort_order`
+        ).bind(term, session, restriction)
+      : env.DB.prepare(
+          `SELECT c.id AS class_id, c.name AS class_name, fs.amount
+           FROM classes c
+           LEFT JOIN fee_structures fs ON fs.class_id = c.id AND fs.term = ? AND fs.session = ?
+           ORDER BY c.sort_order`
+        ).bind(term, session);
 
+    const { results } = await stmt.all();
     return json({ term, session, classes: results });
   }
 
@@ -1707,8 +1924,13 @@ async function handleFeesRoutes(request, env, url) {
       return json({ error: "amount must be a positive number." }, 400);
     }
 
-    const student = await env.DB.prepare("SELECT id, name FROM students WHERE id = ?").bind(studentId).first();
+    const student = await env.DB.prepare("SELECT id, name, level FROM students WHERE id = ?").bind(studentId).first();
     if (!student) return json({ error: "Student not found." }, 404);
+
+    const restriction = adminLevelRestriction(sessionCtx);
+    if (restriction && student.level !== restriction) {
+      return json({ error: "Not authorised for this student." }, 403);
+    }
 
     const id = uuid();
     await env.DB
@@ -1734,8 +1956,13 @@ async function handleFeesRoutes(request, env, url) {
     const session = url.searchParams.get("session");
     if (!term || !session) return json({ error: "term and session are required." }, 400);
 
-    const student = await env.DB.prepare("SELECT id, name, class_id FROM students WHERE id = ?").bind(studentId).first();
+    const student = await env.DB.prepare("SELECT id, name, class_id, level FROM students WHERE id = ?").bind(studentId).first();
     if (!student) return json({ error: "Student not found." }, 404);
+
+    const restriction = adminLevelRestriction(sessionCtx);
+    if (restriction && student.level !== restriction) {
+      return json({ error: "Not authorised for this student." }, 403);
+    }
 
     const structure = await env.DB
       .prepare("SELECT amount FROM fee_structures WHERE class_id = ? AND term = ? AND session = ?")
@@ -1780,6 +2007,12 @@ async function handleFeesRoutes(request, env, url) {
     const session = url.searchParams.get("session");
     if (!term || !session) return json({ error: "term and session are required." }, 400);
 
+    const restriction = adminLevelRestriction(sessionCtx);
+    if (restriction) {
+      const cls = await env.DB.prepare("SELECT level FROM classes WHERE id = ?").bind(classId).first();
+      if (!cls || cls.level !== restriction) return json({ error: "Not authorised for this class." }, 403);
+    }
+
     const structure = await env.DB
       .prepare("SELECT amount FROM fee_structures WHERE class_id = ? AND term = ? AND session = ?")
       .bind(classId, term, session)
@@ -1814,6 +2047,10 @@ async function handleFeesRoutes(request, env, url) {
     const session = url.searchParams.get("session");
     if (!term || !session) return json({ error: "term and session are required." }, 400);
 
+    const restriction = adminLevelRestriction(sessionCtx);
+    const levelJoin = restriction ? "JOIN students st ON st.id = ft.student_id AND st.level = ?" : "";
+    const levelParams = restriction ? [restriction] : [];
+
     const now = new Date();
     const todayStr = now.toISOString().slice(0, 10);
     const weekStart = new Date(now);
@@ -1824,18 +2061,24 @@ async function handleFeesRoutes(request, env, url) {
     async function sumSince(sinceDate) {
       const row = await env.DB
         .prepare(
-          `SELECT COALESCE(SUM(amount), 0) AS total, COUNT(*) AS count
-           FROM fee_transactions
-           WHERE term = ? AND session = ? AND date(recorded_at) >= date(?)`
+          `SELECT COALESCE(SUM(ft.amount), 0) AS total, COUNT(*) AS count
+           FROM fee_transactions ft
+           ${levelJoin}
+           WHERE ft.term = ? AND ft.session = ? AND date(ft.recorded_at) >= date(?)`
         )
-        .bind(term, session, sinceDate)
+        .bind(...levelParams, term, session, sinceDate)
         .first();
       return { total: row.total, count: row.count };
     }
 
     const termRow = await env.DB
-      .prepare("SELECT COALESCE(SUM(amount), 0) AS total, COUNT(*) AS count FROM fee_transactions WHERE term = ? AND session = ?")
-      .bind(term, session)
+      .prepare(
+        `SELECT COALESCE(SUM(ft.amount), 0) AS total, COUNT(*) AS count
+         FROM fee_transactions ft
+         ${levelJoin}
+         WHERE ft.term = ? AND ft.session = ?`
+      )
+      .bind(...levelParams, term, session)
       .first();
 
     return json({
@@ -1897,6 +2140,11 @@ async function handleReportCardRoutes(request, env, url) {
       .bind(studentId)
       .first();
     if (!student) return json({ error: "Student not found." }, 404);
+
+    const restriction = adminLevelRestriction(sessionCtx);
+    if (restriction && isTeachingStaff(sessionCtx) && student.level !== restriction) {
+      return json({ error: "Not authorised for this student." }, 403);
+    }
 
     // ---- Subject scores (approved only) ----
     const { results: subjectRows } = await env.DB
@@ -2031,6 +2279,12 @@ async function handleReportCardRoutes(request, env, url) {
       return json({ error: "Not authorised to set the principal remark." }, 403);
     }
 
+    const restriction = adminLevelRestriction(sessionCtx);
+    if (restriction) {
+      const stu = await env.DB.prepare("SELECT level FROM students WHERE id = ?").bind(studentId).first();
+      if (!stu || stu.level !== restriction) return json({ error: "Not authorised for this student." }, 403);
+    }
+
     const existing = await env.DB
       .prepare("SELECT id, teacher_remark, principal_remark FROM report_remarks WHERE student_id = ? AND term = ? AND session = ?")
       .bind(studentId, term, session)
@@ -2086,7 +2340,7 @@ async function handleCbtRoutes(request, env, url) {
   // ---------------- CREATE TEST ----------------
   if (pathname === "/api/cbt/tests" && request.method === "POST") {
     const sessionCtx = await getSession(request, env);
-    if (!isTeachingStaff(sessionCtx)) return json({ error: "Not authorised." }, 403);
+    if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised. Only admins can create and publish tests." }, 403);
 
     const { title, classId, subjectId, term, session, durationMinutes } = await request.json();
     if (!title || !classId || !subjectId || !term || !session || !durationMinutes) {
@@ -2094,6 +2348,12 @@ async function handleCbtRoutes(request, env, url) {
     }
     if (isNaN(durationMinutes) || Number(durationMinutes) <= 0) {
       return json({ error: "durationMinutes must be a positive number." }, 400);
+    }
+
+    const restriction = adminLevelRestriction(sessionCtx);
+    if (restriction) {
+      const cls = await env.DB.prepare("SELECT level FROM classes WHERE id = ?").bind(classId).first();
+      if (!cls || cls.level !== restriction) return json({ error: "Not authorised for this class." }, 403);
     }
 
     const id = uuid();
@@ -2118,6 +2378,12 @@ async function handleCbtRoutes(request, env, url) {
     const session = url.searchParams.get("session");
     if (!classId || !term || !session) return json({ error: "classId, term, and session are required." }, 400);
 
+    const restriction = adminLevelRestriction(sessionCtx);
+    if (restriction) {
+      const cls = await env.DB.prepare("SELECT level FROM classes WHERE id = ?").bind(classId).first();
+      if (!cls || cls.level !== restriction) return json({ error: "Not authorised for this class." }, 403);
+    }
+
     const { results } = await env.DB
       .prepare(
         `SELECT t.id, t.title, t.duration_minutes, t.status, t.created_at, t.subject_id, sub.name AS subject_name,
@@ -2138,13 +2404,19 @@ async function handleCbtRoutes(request, env, url) {
   const testMatch = pathname.match(/^\/api\/cbt\/tests\/([^/]+)$/);
   if (testMatch && request.method === "PATCH") {
     const sessionCtx = await getSession(request, env);
-    if (!isTeachingStaff(sessionCtx)) return json({ error: "Not authorised." }, 403);
+    if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised. Only admins can manage tests." }, 403);
 
     const testId = testMatch[1];
     const { title, durationMinutes, status } = await request.json();
 
-    const test = await env.DB.prepare("SELECT id FROM cbt_tests WHERE id = ?").bind(testId).first();
+    const test = await env.DB.prepare("SELECT id, class_id FROM cbt_tests WHERE id = ?").bind(testId).first();
     if (!test) return json({ error: "Test not found." }, 404);
+
+    const restriction = adminLevelRestriction(sessionCtx);
+    if (restriction) {
+      const cls = await env.DB.prepare("SELECT level FROM classes WHERE id = ?").bind(test.class_id).first();
+      if (!cls || cls.level !== restriction) return json({ error: "Not authorised for this test." }, 403);
+    }
 
     if (status !== undefined) {
       if (!["draft", "published"].includes(status)) return json({ error: "status must be 'draft' or 'published'." }, 400);
@@ -2167,9 +2439,18 @@ async function handleCbtRoutes(request, env, url) {
   // ---------------- DELETE TEST ----------------
   if (testMatch && request.method === "DELETE") {
     const sessionCtx = await getSession(request, env);
-    if (!isTeachingStaff(sessionCtx)) return json({ error: "Not authorised." }, 403);
+    if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised. Only admins can delete tests." }, 403);
 
     const testId = testMatch[1];
+    const restriction = adminLevelRestriction(sessionCtx);
+    if (restriction) {
+      const test = await env.DB.prepare("SELECT class_id FROM cbt_tests WHERE id = ?").bind(testId).first();
+      if (test) {
+        const cls = await env.DB.prepare("SELECT level FROM classes WHERE id = ?").bind(test.class_id).first();
+        if (!cls || cls.level !== restriction) return json({ error: "Not authorised for this test." }, 403);
+      }
+    }
+
     await env.DB.prepare("DELETE FROM cbt_submissions WHERE test_id = ?").bind(testId).run();
     await env.DB.prepare("DELETE FROM cbt_questions WHERE test_id = ?").bind(testId).run();
     await env.DB.prepare("DELETE FROM cbt_tests WHERE id = ?").bind(testId).run();
@@ -2181,12 +2462,18 @@ async function handleCbtRoutes(request, env, url) {
   const questionsMatch = pathname.match(/^\/api\/cbt\/tests\/([^/]+)\/questions$/);
   if (questionsMatch && request.method === "POST") {
     const sessionCtx = await getSession(request, env);
-    if (!isTeachingStaff(sessionCtx)) return json({ error: "Not authorised." }, 403);
+    if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised. Only admins manage test questions directly." }, 403);
 
     const testId = questionsMatch[1];
-    const test = await env.DB.prepare("SELECT id, status FROM cbt_tests WHERE id = ?").bind(testId).first();
+    const test = await env.DB.prepare("SELECT id, status, class_id FROM cbt_tests WHERE id = ?").bind(testId).first();
     if (!test) return json({ error: "Test not found." }, 404);
     if (test.status === "published") return json({ error: "Unpublish the test before editing its questions." }, 400);
+
+    const restriction = adminLevelRestriction(sessionCtx);
+    if (restriction) {
+      const cls = await env.DB.prepare("SELECT level FROM classes WHERE id = ?").bind(test.class_id).first();
+      if (!cls || cls.level !== restriction) return json({ error: "Not authorised for this test." }, 403);
+    }
 
     const { questionText, type, optionA, optionB, optionC, optionD, correctOption, points, saveToBank } = await request.json();
     if (!questionText || !type || !correctOption) {
@@ -2231,9 +2518,18 @@ async function handleCbtRoutes(request, env, url) {
   // ---------------- LIST QUESTIONS (with correct answers, for editing) ----------------
   if (questionsMatch && request.method === "GET") {
     const sessionCtx = await getSession(request, env);
-    if (!isTeachingStaff(sessionCtx)) return json({ error: "Not authorised." }, 403);
+    if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
 
     const testId = questionsMatch[1];
+    const restriction = adminLevelRestriction(sessionCtx);
+    if (restriction) {
+      const test = await env.DB.prepare("SELECT class_id FROM cbt_tests WHERE id = ?").bind(testId).first();
+      if (test) {
+        const cls = await env.DB.prepare("SELECT level FROM classes WHERE id = ?").bind(test.class_id).first();
+        if (!cls || cls.level !== restriction) return json({ error: "Not authorised for this test." }, 403);
+      }
+    }
+
     const { results } = await env.DB
       .prepare("SELECT * FROM cbt_questions WHERE test_id = ? ORDER BY sort_order")
       .bind(testId)
@@ -2246,11 +2542,17 @@ async function handleCbtRoutes(request, env, url) {
   const questionDeleteMatch = pathname.match(/^\/api\/cbt\/tests\/([^/]+)\/questions\/([^/]+)$/);
   if (questionDeleteMatch && request.method === "DELETE") {
     const sessionCtx = await getSession(request, env);
-    if (!isTeachingStaff(sessionCtx)) return json({ error: "Not authorised." }, 403);
+    if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
 
     const [, testId, questionId] = questionDeleteMatch;
-    const test = await env.DB.prepare("SELECT status FROM cbt_tests WHERE id = ?").bind(testId).first();
+    const test = await env.DB.prepare("SELECT status, class_id FROM cbt_tests WHERE id = ?").bind(testId).first();
     if (test && test.status === "published") return json({ error: "Unpublish the test before editing its questions." }, 400);
+
+    const restriction = adminLevelRestriction(sessionCtx);
+    if (restriction && test) {
+      const cls = await env.DB.prepare("SELECT level FROM classes WHERE id = ?").bind(test.class_id).first();
+      if (!cls || cls.level !== restriction) return json({ error: "Not authorised for this test." }, 403);
+    }
 
     await env.DB.prepare("DELETE FROM cbt_questions WHERE id = ? AND test_id = ?").bind(questionId, testId).run();
     return json({ message: "Question removed." });
@@ -2276,6 +2578,12 @@ async function handleCbtRoutes(request, env, url) {
       return json({ error: "For mcq questions, correctOption must be 'A', 'B', 'C', or 'D'." }, 400);
     }
 
+    const restriction = adminLevelRestriction(sessionCtx);
+    if (restriction) {
+      const cls = await env.DB.prepare("SELECT level FROM classes WHERE id = ?").bind(classId).first();
+      if (!cls || cls.level !== restriction) return json({ error: "Not authorised for this class." }, 403);
+    }
+
     const id = uuid();
     await env.DB
       .prepare(
@@ -2298,6 +2606,12 @@ async function handleCbtRoutes(request, env, url) {
     const term = url.searchParams.get("term");
     if (!classId || !subjectId || !term) return json({ error: "classId, subjectId, and term are required." }, 400);
 
+    const restriction = adminLevelRestriction(sessionCtx);
+    if (restriction) {
+      const cls = await env.DB.prepare("SELECT level FROM classes WHERE id = ?").bind(classId).first();
+      if (!cls || cls.level !== restriction) return json({ error: "Not authorised for this class." }, 403);
+    }
+
     const { results } = await env.DB
       .prepare(
         `SELECT * FROM cbt_question_bank
@@ -2316,6 +2630,15 @@ async function handleCbtRoutes(request, env, url) {
     const sessionCtx = await getSession(request, env);
     if (!isTeachingStaff(sessionCtx)) return json({ error: "Not authorised." }, 403);
 
+    const restriction = adminLevelRestriction(sessionCtx);
+    if (restriction) {
+      const bq = await env.DB.prepare("SELECT class_id FROM cbt_question_bank WHERE id = ?").bind(bankDeleteMatch[1]).first();
+      if (bq) {
+        const cls = await env.DB.prepare("SELECT level FROM classes WHERE id = ?").bind(bq.class_id).first();
+        if (!cls || cls.level !== restriction) return json({ error: "Not authorised for this question." }, 403);
+      }
+    }
+
     await env.DB.prepare("DELETE FROM cbt_question_bank WHERE id = ?").bind(bankDeleteMatch[1]).run();
     return json({ message: "Removed from question bank." });
   }
@@ -2324,12 +2647,18 @@ async function handleCbtRoutes(request, env, url) {
   const fromBankMatch = pathname.match(/^\/api\/cbt\/tests\/([^/]+)\/questions\/from-bank$/);
   if (fromBankMatch && request.method === "POST") {
     const sessionCtx = await getSession(request, env);
-    if (!isTeachingStaff(sessionCtx)) return json({ error: "Not authorised." }, 403);
+    if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised. Only admins manage test questions directly." }, 403);
 
     const testId = fromBankMatch[1];
-    const test = await env.DB.prepare("SELECT id, status FROM cbt_tests WHERE id = ?").bind(testId).first();
+    const test = await env.DB.prepare("SELECT id, status, class_id FROM cbt_tests WHERE id = ?").bind(testId).first();
     if (!test) return json({ error: "Test not found." }, 404);
     if (test.status === "published") return json({ error: "Unpublish the test before editing its questions." }, 400);
+
+    const restriction = adminLevelRestriction(sessionCtx);
+    if (restriction) {
+      const cls = await env.DB.prepare("SELECT level FROM classes WHERE id = ?").bind(test.class_id).first();
+      if (!cls || cls.level !== restriction) return json({ error: "Not authorised for this test." }, 403);
+    }
 
     const { questionBankIds } = await request.json();
     if (!Array.isArray(questionBankIds) || !questionBankIds.length) {
@@ -2366,6 +2695,15 @@ async function handleCbtRoutes(request, env, url) {
     if (!isTeachingStaff(sessionCtx)) return json({ error: "Not authorised." }, 403);
 
     const testId = resultsMatch[1];
+    const restriction = adminLevelRestriction(sessionCtx);
+    if (restriction) {
+      const test = await env.DB.prepare("SELECT class_id FROM cbt_tests WHERE id = ?").bind(testId).first();
+      if (test) {
+        const cls = await env.DB.prepare("SELECT level FROM classes WHERE id = ?").bind(test.class_id).first();
+        if (!cls || cls.level !== restriction) return json({ error: "Not authorised for this test." }, 403);
+      }
+    }
+
     const { results } = await env.DB
       .prepare(
         `SELECT s.id, st.name AS student_name, st.admission_no, s.score, s.total_points, s.submitted_at
@@ -2394,7 +2732,7 @@ async function handleCbtRoutes(request, env, url) {
          FROM cbt_tests t
          JOIN subjects sub ON sub.id = t.subject_id
          LEFT JOIN cbt_submissions sub2 ON sub2.test_id = t.id AND sub2.student_id = ?
-         WHERE t.class_id = ? AND t.status = 'published'
+         WHERE t.class_id = ? AND (t.status = 'published' OR sub2.score IS NOT NULL)
          ORDER BY t.created_at DESC`
       )
       .bind(sessionCtx.id, classId)
@@ -2538,6 +2876,20 @@ async function handleAnnouncementRoutes(request, env, url) {
       return json({ error: "Invalid audience." }, 400);
     }
 
+    const restriction = adminLevelRestriction(sessionCtx);
+    if (restriction) {
+      const allowedDirect = audience === restriction;
+      const allowedClass = audience.startsWith("class_");
+      if (!allowedDirect && !allowedClass) {
+        return json({ error: `As a ${restriction} admin, you can only post to "${restriction}" or a specific ${restriction} class.` }, 403);
+      }
+      if (allowedClass) {
+        const classId = audience.slice("class_".length);
+        const cls = await env.DB.prepare("SELECT level FROM classes WHERE id = ?").bind(classId).first();
+        if (!cls || cls.level !== restriction) return json({ error: "Not authorised for this class." }, 403);
+      }
+    }
+
     const id = uuid();
     await env.DB
       .prepare("INSERT INTO announcements (id, title, body, audience, created_by, created_at) VALUES (?, ?, ?, ?, ?, datetime('now'))")
@@ -2574,7 +2926,21 @@ async function handleAnnouncementRoutes(request, env, url) {
       )
       .all();
 
-    return json({ announcements: results });
+    const restriction = adminLevelRestriction(sessionCtx);
+    if (!restriction) return json({ announcements: results });
+
+    const { results: classRows } = await env.DB.prepare("SELECT id, level FROM classes").all();
+    const classLevelMap = Object.fromEntries(classRows.map(c => [c.id, c.level]));
+
+    const filtered = results.filter(a => {
+      if (a.audience === restriction) return true;
+      if (a.audience.startsWith("class_")) {
+        return classLevelMap[a.audience.slice("class_".length)] === restriction;
+      }
+      return false;
+    });
+
+    return json({ announcements: filtered });
   }
 
   // ---------------- DELETE ----------------
@@ -2582,6 +2948,19 @@ async function handleAnnouncementRoutes(request, env, url) {
   if (deleteMatch && request.method === "DELETE") {
     const sessionCtx = await getSession(request, env);
     if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const restriction = adminLevelRestriction(sessionCtx);
+    if (restriction) {
+      const ann = await env.DB.prepare("SELECT audience FROM announcements WHERE id = ?").bind(deleteMatch[1]).first();
+      if (ann) {
+        let allowed = ann.audience === restriction;
+        if (!allowed && ann.audience.startsWith("class_")) {
+          const cls = await env.DB.prepare("SELECT level FROM classes WHERE id = ?").bind(ann.audience.slice("class_".length)).first();
+          allowed = !!cls && cls.level === restriction;
+        }
+        if (!allowed) return json({ error: "Not authorised for this announcement." }, 403);
+      }
+    }
 
     await env.DB.prepare("DELETE FROM announcements WHERE id = ?").bind(deleteMatch[1]).run();
     return json({ message: "Announcement deleted." });
@@ -2639,6 +3018,12 @@ async function handleResultsRoutes(request, env, url) {
       return json({ error: "studentId, classId, subjectId, term, and session are required." }, 400);
     }
 
+    const restriction = adminLevelRestriction(sessionCtx);
+    if (restriction) {
+      const cls = await env.DB.prepare("SELECT level FROM classes WHERE id = ?").bind(classId).first();
+      if (!cls || cls.level !== restriction) return json({ error: "Not authorised for this class." }, 403);
+    }
+
     const ca1Val = ca1 === "" || ca1 === undefined || ca1 === null ? null : Number(ca1);
     const ca2Val = ca2 === "" || ca2 === undefined || ca2 === null ? null : Number(ca2);
     const examVal = exam === "" || exam === undefined || exam === null ? null : Number(exam);
@@ -2685,6 +3070,12 @@ async function handleResultsRoutes(request, env, url) {
       return json({ error: "classId, subjectId, term, and session are required." }, 400);
     }
 
+    const restriction = adminLevelRestriction(sessionCtx);
+    if (restriction) {
+      const cls = await env.DB.prepare("SELECT level FROM classes WHERE id = ?").bind(classId).first();
+      if (!cls || cls.level !== restriction) return json({ error: "Not authorised for this class." }, 403);
+    }
+
     const { results } = await env.DB
       .prepare(
         `SELECT s.id AS student_id, s.name AS student_name,
@@ -2711,6 +3102,12 @@ async function handleResultsRoutes(request, env, url) {
     const session = url.searchParams.get("session");
     if (!classId || !term || !session) {
       return json({ error: "classId, term, and session are required." }, 400);
+    }
+
+    const restriction = adminLevelRestriction(sessionCtx);
+    if (restriction) {
+      const cls = await env.DB.prepare("SELECT level FROM classes WHERE id = ?").bind(classId).first();
+      if (!cls || cls.level !== restriction) return json({ error: "Not authorised for this class." }, 403);
     }
 
     const { results } = await env.DB
@@ -2741,6 +3138,15 @@ async function handleResultsRoutes(request, env, url) {
       return json({ error: "status must be 'approved', 'withheld', or 'pending'." }, 400);
     }
 
+    const restriction = adminLevelRestriction(sessionCtx);
+    if (restriction) {
+      const row = await env.DB
+        .prepare(`SELECT c.level FROM results r JOIN classes c ON c.id = r.class_id WHERE r.id = ?`)
+        .bind(resultId)
+        .first();
+      if (!row || row.level !== restriction) return json({ error: "Not authorised for this result." }, 403);
+    }
+
     await env.DB
       .prepare("UPDATE results SET status = ?, updated_at = datetime('now') WHERE id = ?")
       .bind(status, resultId)
@@ -2757,6 +3163,12 @@ async function handleResultsRoutes(request, env, url) {
     const { classId, term, session } = await request.json();
     if (!classId || !term || !session) {
       return json({ error: "classId, term, and session are required." }, 400);
+    }
+
+    const restriction = adminLevelRestriction(sessionCtx);
+    if (restriction) {
+      const cls = await env.DB.prepare("SELECT level FROM classes WHERE id = ?").bind(classId).first();
+      if (!cls || cls.level !== restriction) return json({ error: "Not authorised for this class." }, 403);
     }
 
     await env.DB
