@@ -1696,23 +1696,22 @@ function generateTempPassword() {
 async function handleManageAccountsRoutes(request, env, url) {
   const { pathname } = url;
 
+  function isGeneralAdmin(session) {
+    return !!session && session.type === "staff" && session.role === "general_admin";
+  }
+
   // ---------------- LIST ALL STAFF ----------------
   if (pathname === "/api/staff" && request.method === "GET") {
     const sessionCtx = await getSession(request, env);
-    if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
+    if (!isGeneralAdmin(sessionCtx)) return json({ error: "Not authorised. Only the General Admin can manage accounts." }, 403);
 
-    const restriction = adminLevelRestriction(sessionCtx);
-    const stmt = restriction
-      ? env.DB.prepare(
-          `SELECT id, name, email, role, level, status, created_at, approved_by, approved_at
-           FROM users WHERE status IN ('active', 'suspended') AND level = ? ORDER BY name`
-        ).bind(restriction)
-      : env.DB.prepare(
-          `SELECT id, name, email, role, level, status, created_at, approved_by, approved_at
-           FROM users WHERE status IN ('active', 'suspended') ORDER BY name`
-        );
+    const { results } = await env.DB
+      .prepare(
+        `SELECT id, name, email, role, level, status, created_at, approved_by, approved_at
+         FROM users WHERE status IN ('active', 'suspended') ORDER BY name`
+      )
+      .all();
 
-    const { results } = await stmt.all();
     return json({ staff: results });
   }
 
@@ -1720,7 +1719,7 @@ async function handleManageAccountsRoutes(request, env, url) {
   const roleMatch = pathname.match(/^\/api\/staff\/([^/]+)$/);
   if (roleMatch && request.method === "PATCH") {
     const sessionCtx = await getSession(request, env);
-    if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
+    if (!isGeneralAdmin(sessionCtx)) return json({ error: "Not authorised. Only the General Admin can manage accounts." }, 403);
 
     const staffId = roleMatch[1];
     const { role, level } = await request.json();
@@ -1729,17 +1728,8 @@ async function handleManageAccountsRoutes(request, env, url) {
       return json({ error: "Invalid role." }, 400);
     }
 
-    const target = await env.DB.prepare("SELECT id, level FROM users WHERE id = ?").bind(staffId).first();
+    const target = await env.DB.prepare("SELECT id FROM users WHERE id = ?").bind(staffId).first();
     if (!target) return json({ error: "Account not found." }, 404);
-
-    const restriction = adminLevelRestriction(sessionCtx);
-    if (restriction) {
-      if (target.level !== restriction) return json({ error: "Not authorised for this account." }, 403);
-      if (level !== restriction) return json({ error: `As a ${restriction} admin, you can only set ${restriction}-level accounts.` }, 403);
-      if (["general_admin", restriction === "primary" ? "secondary_admin" : "primary_admin"].includes(role)) {
-        return json({ error: "Not authorised to assign that role." }, 403);
-      }
-    }
 
     await env.DB
       .prepare("UPDATE users SET role = ?, level = ? WHERE id = ?")
@@ -1753,7 +1743,7 @@ async function handleManageAccountsRoutes(request, env, url) {
   const statusMatch = pathname.match(/^\/api\/staff\/([^/]+)\/status$/);
   if (statusMatch && request.method === "PATCH") {
     const sessionCtx = await getSession(request, env);
-    if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
+    if (!isGeneralAdmin(sessionCtx)) return json({ error: "Not authorised. Only the General Admin can manage accounts." }, 403);
 
     const staffId = statusMatch[1];
     const { status } = await request.json();
@@ -1765,13 +1755,8 @@ async function handleManageAccountsRoutes(request, env, url) {
       return json({ error: "You can't suspend your own account." }, 400);
     }
 
-    const target = await env.DB.prepare("SELECT id, level FROM users WHERE id = ?").bind(staffId).first();
+    const target = await env.DB.prepare("SELECT id FROM users WHERE id = ?").bind(staffId).first();
     if (!target) return json({ error: "Account not found." }, 404);
-
-    const restriction = adminLevelRestriction(sessionCtx);
-    if (restriction && target.level !== restriction) {
-      return json({ error: "Not authorised for this account." }, 403);
-    }
 
     await env.DB.prepare("UPDATE users SET status = ? WHERE id = ?").bind(status, staffId).run();
 
@@ -1782,16 +1767,11 @@ async function handleManageAccountsRoutes(request, env, url) {
   const resetMatch = pathname.match(/^\/api\/staff\/([^/]+)\/reset-password$/);
   if (resetMatch && request.method === "POST") {
     const sessionCtx = await getSession(request, env);
-    if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
+    if (!isGeneralAdmin(sessionCtx)) return json({ error: "Not authorised. Only the General Admin can manage accounts." }, 403);
 
     const staffId = resetMatch[1];
-    const target = await env.DB.prepare("SELECT id, level FROM users WHERE id = ?").bind(staffId).first();
+    const target = await env.DB.prepare("SELECT id FROM users WHERE id = ?").bind(staffId).first();
     if (!target) return json({ error: "Account not found." }, 404);
-
-    const restriction = adminLevelRestriction(sessionCtx);
-    if (restriction && target.level !== restriction) {
-      return json({ error: "Not authorised for this account." }, 403);
-    }
 
     const tempPassword = generateTempPassword();
     const passwordHash = await hash(tempPassword);
@@ -1805,17 +1785,11 @@ async function handleManageAccountsRoutes(request, env, url) {
   const deleteMatch = pathname.match(/^\/api\/staff\/([^/]+)$/);
   if (deleteMatch && request.method === "DELETE") {
     const sessionCtx = await getSession(request, env);
-    if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
+    if (!isGeneralAdmin(sessionCtx)) return json({ error: "Not authorised. Only the General Admin can manage accounts." }, 403);
 
     const staffId = deleteMatch[1];
     if (staffId === sessionCtx.id) {
       return json({ error: "You can't delete your own account." }, 400);
-    }
-
-    const restriction = adminLevelRestriction(sessionCtx);
-    if (restriction) {
-      const target = await env.DB.prepare("SELECT level FROM users WHERE id = ?").bind(staffId).first();
-      if (!target || target.level !== restriction) return json({ error: "Not authorised for this account." }, 403);
     }
 
     await env.DB.prepare("DELETE FROM users WHERE id = ?").bind(staffId).run();
