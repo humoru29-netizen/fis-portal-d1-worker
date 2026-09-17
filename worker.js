@@ -3001,6 +3001,17 @@ async function handleResultsRoutes(request, env, url) {
     const ca1Val = ca1 === "" || ca1 === undefined || ca1 === null ? null : Number(ca1);
     const ca2Val = ca2 === "" || ca2 === undefined || ca2 === null ? null : Number(ca2);
     const examVal = exam === "" || exam === undefined || exam === null ? null : Number(exam);
+
+    if (ca1Val !== null && (isNaN(ca1Val) || ca1Val < 0 || ca1Val > 15)) {
+      return json({ error: "CA1 must be between 0 and 15." }, 400);
+    }
+    if (ca2Val !== null && (isNaN(ca2Val) || ca2Val < 0 || ca2Val > 15)) {
+      return json({ error: "CA2 must be between 0 and 15." }, 400);
+    }
+    if (examVal !== null && (isNaN(examVal) || examVal < 0 || examVal > 70)) {
+      return json({ error: "Exam must be between 0 and 70." }, 400);
+    }
+
     const total = (ca1Val || 0) + (ca2Val || 0) + (examVal || 0);
     const grade = computeGrade(total);
 
