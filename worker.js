@@ -703,6 +703,153 @@ async function handleAttendanceRoutes(request, env, url) {
 
     return null; // not handled here — let the router try the next module
 }
+
+/**
+ * FIS Itobe Portal — Worker route module (Timetable)
+ *
+ * Routes:
+ *   GET    /api/timetable?classId=                (auth: any logged-in) full week for a class
+ *   GET    /api/timetable/teacher/:teacherId       (auth: any logged-in) a teacher's own week, across classes
+ *   POST   /api/timetable                          (auth: admin, or teacher for their own slot) create/update a slot
+ *          body: { classId, subjectId, teacherId, dayOfWeek, startTime, endTime }
+ *   DELETE /api/timetable/:id                      (auth: admin, or teacher who owns the slot)
+ *
+ * Permission rule: admins (general/primary/secondary, subject to level
+ * restriction) can create/edit/delete any slot. A teacher may only
+ * create/edit/delete a slot where teacherId equals their own session id —
+ * enforced server-side here, not just hidden in the UI.
+ */
+
+const VALID_DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"];
+
+async function handleTimetableRoutes(request, env, url) {
+  const { pathname } = url;
+
+  // ---------------- VIEW FULL WEEK FOR A CLASS ----------------
+  if (pathname === "/api/timetable" && request.method === "GET") {
+    const sessionCtx = await getSession(request, env);
+    if (!sessionCtx) return json({ error: "Not authenticated." }, 401);
+
+    const classId = url.searchParams.get("classId");
+    if (!classId) return json({ error: "classId is required." }, 400);
+
+    const restriction = adminLevelRestriction(sessionCtx);
+    if (restriction) {
+      const cls = await env.DB.prepare("SELECT level FROM classes WHERE id = ?").bind(classId).first();
+      if (!cls || cls.level !== restriction) return json({ error: "Not authorised for this class." }, 403);
+    }
+
+    const { results } = await env.DB
+      .prepare(
+        `SELECT t.id, t.day_of_week, t.start_time, t.end_time,
+                t.subject_id, sub.name AS subject_name,
+                t.teacher_id, u.name AS teacher_name
+         FROM timetable_slots t
+         JOIN subjects sub ON sub.id = t.subject_id
+         LEFT JOIN users u ON u.id = t.teacher_id
+         WHERE t.class_id = ?
+         ORDER BY t.day_of_week, t.start_time`
+      )
+      .bind(classId)
+      .all();
+
+    return json({ classId, slots: results });
+  }
+
+  // ---------------- A TEACHER'S OWN WEEK, ACROSS CLASSES ----------------
+  const teacherMatch = pathname.match(/^\/api\/timetable\/teacher\/([^/]+)$/);
+  if (teacherMatch && request.method === "GET") {
+    const sessionCtx = await getSession(request, env);
+    if (!sessionCtx) return json({ error: "Not authenticated." }, 401);
+
+    const teacherId = teacherMatch[1];
+    // A teacher may only view their own schedule this way; admins may view anyone's.
+    if (!isAdminSession(sessionCtx) && sessionCtx.id !== teacherId) {
+      return json({ error: "Not authorised." }, 403);
+    }
+
+    const { results } = await env.DB
+      .prepare(
+        `SELECT t.id, t.day_of_week, t.start_time, t.end_time,
+                t.class_id, c.name AS class_name,
+                t.subject_id, sub.name AS subject_name
+         FROM timetable_slots t
+         JOIN classes c ON c.id = t.class_id
+         JOIN subjects sub ON sub.id = t.subject_id
+         WHERE t.teacher_id = ?
+         ORDER BY t.day_of_week, t.start_time`
+      )
+      .bind(teacherId)
+      .all();
+
+    return json({ teacherId, slots: results });
+  }
+
+  // ---------------- CREATE / UPDATE A SLOT ----------------
+  if (pathname === "/api/timetable" && request.method === "POST") {
+    const sessionCtx = await getSession(request, env);
+    if (!isTeachingStaff(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const { classId, subjectId, teacherId, dayOfWeek, startTime, endTime } = await request.json();
+    if (!classId || !subjectId || !dayOfWeek || !startTime || !endTime) {
+      return json({ error: "classId, subjectId, dayOfWeek, startTime, and endTime are required." }, 400);
+    }
+    if (!VALID_DAYS.includes(dayOfWeek)) {
+      return json({ error: `dayOfWeek must be one of: ${VALID_DAYS.join(", ")}` }, 400);
+    }
+
+    // Teachers (non-admin) may only manage their own slots.
+    if (!isAdminSession(sessionCtx)) {
+      if (!teacherId || teacherId !== sessionCtx.id) {
+        return json({ error: "Teachers may only assign themselves to a slot." }, 403);
+      }
+    }
+
+    const restriction = adminLevelRestriction(sessionCtx);
+    if (restriction) {
+      const cls = await env.DB.prepare("SELECT level FROM classes WHERE id = ?").bind(classId).first();
+      if (!cls || cls.level !== restriction) return json({ error: "Not authorised for this class." }, 403);
+    }
+
+    await env.DB.prepare(
+      `INSERT INTO timetable_slots (id, class_id, subject_id, teacher_id, day_of_week, start_time, end_time)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(class_id, day_of_week, start_time) DO UPDATE SET
+         subject_id = excluded.subject_id,
+         teacher_id = excluded.teacher_id,
+         end_time = excluded.end_time`
+    ).bind(uuid(), classId, subjectId, teacherId || null, dayOfWeek, startTime, endTime).run();
+
+    return json({ message: "Timetable slot saved." });
+  }
+
+  // ---------------- DELETE A SLOT ----------------
+  const deleteMatch = pathname.match(/^\/api\/timetable\/([^/]+)$/);
+  if (deleteMatch && request.method === "DELETE") {
+    const sessionCtx = await getSession(request, env);
+    if (!isTeachingStaff(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const slotId = deleteMatch[1];
+    const slot = await env.DB.prepare("SELECT class_id, teacher_id FROM timetable_slots WHERE id = ?").bind(slotId).first();
+    if (!slot) return json({ error: "Slot not found." }, 404);
+
+    if (!isAdminSession(sessionCtx) && slot.teacher_id !== sessionCtx.id) {
+      return json({ error: "You may only delete your own slots." }, 403);
+    }
+
+    const restriction = adminLevelRestriction(sessionCtx);
+    if (restriction) {
+      const cls = await env.DB.prepare("SELECT level FROM classes WHERE id = ?").bind(slot.class_id).first();
+      if (!cls || cls.level !== restriction) return json({ error: "Not authorised for this class." }, 403);
+    }
+
+    await env.DB.prepare("DELETE FROM timetable_slots WHERE id = ?").bind(slotId).run();
+    return json({ message: "Timetable slot deleted." });
+  }
+
+  return null; // not handled here — let the router try the next module
+}
+
 /**
  * FIS Itobe Portal — Worker route module (Assignments)
  *
@@ -3177,6 +3324,7 @@ const modules = [
   handleAuthRoutes,
   handleStudentAuthRoutes,
   handleAttendanceRoutes,
+  handleTimetableRoutes,
   handleAssignmentRoutes,
   handleRosterRoutes,
   handleTeacherAssignmentRoutes,
