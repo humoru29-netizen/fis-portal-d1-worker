@@ -293,8 +293,8 @@ function adminLevelRestriction(session) {
  * Routes:
  *   POST /api/signup            { name, email, password, requestedRole, requestedLevel }
  *   POST /api/login             { email, password }
- *   GET  /api/approvals         (auth: admin) list pending users
- *   POST /api/approvals/:id     (auth: admin) { action: 'approve'|'reject', role, level }
+ *   GET  /api/approvals         (auth: general_admin) list pending users
+ *   POST /api/approvals/:id     (auth: general_admin) { action: 'approve'|'reject', role, level }
  *   GET  /api/me                (auth: any staff) return current user profile
  */
 
@@ -393,10 +393,9 @@ async function handleAuthRoutes(request, env, url) {
   // ---------------- LIST PENDING APPROVALS ----------------
   if (pathname === "/api/approvals" && request.method === "GET") {
     const sessionCtx = await getSession(request, env);
-    if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
+    if (!isGeneralAdmin(sessionCtx)) return json({ error: "Not authorised." }, 403);
 
-    const restriction = adminLevelRestriction(sessionCtx);
-    const level = restriction || url.searchParams.get("level");
+    const level = url.searchParams.get("level");
     const stmt = level
       ? env.DB.prepare("SELECT id, name, email, requested_role, requested_level, created_at FROM users WHERE status = 'pending' AND requested_level = ?").bind(level)
       : env.DB.prepare("SELECT id, name, email, requested_role, requested_level, created_at FROM users WHERE status = 'pending'");
@@ -409,7 +408,7 @@ async function handleAuthRoutes(request, env, url) {
   const approvalMatch = pathname.match(/^\/api\/approvals\/([^/]+)$/);
   if (approvalMatch && request.method === "POST") {
     const sessionCtx = await getSession(request, env);
-    if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
+    if (!isGeneralAdmin(sessionCtx)) return json({ error: "Not authorised." }, 403);
 
     const userId = approvalMatch[1];
     const { action, role, level } = await request.json();
@@ -420,19 +419,8 @@ async function handleAuthRoutes(request, env, url) {
       .first();
     if (!target) return json({ error: "Request not found or already handled." }, 404);
 
-    const restriction = adminLevelRestriction(sessionCtx);
-    if (restriction && target.requested_level !== restriction) {
-      return json({ error: "Not authorised for this request." }, 403);
-    }
-    if (restriction && action === "approve" && level && level !== restriction) {
-      return json({ error: `As a ${restriction} admin, you can only approve at ${restriction} level.` }, 403);
-    }
-
     if (action === "approve") {
       if (!role) return json({ error: "Approved role is required." }, 400);
-      if (restriction && ["general_admin", restriction === "primary" ? "secondary_admin" : "primary_admin"].includes(role)) {
-        return json({ error: "Not authorised to assign that role." }, 403);
-      }
       await env.DB
         .prepare(
           `UPDATE users SET status = 'active', role = ?, level = ?, approved_by = ?, approved_at = datetime('now')
