@@ -1,0 +1,12 @@
+name = "fis-d1"
+main = "worker.js"
+compatibility_date = "2025-01-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "fis-portal-db"
+database_id = "9521b6fd-ea7a-4f30-aec8-f4ef075ca72a"
+
+[assets]
+directory = "./public"
+binding = "ASSETS"
