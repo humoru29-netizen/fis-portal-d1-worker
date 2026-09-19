@@ -3501,6 +3501,12 @@ export default {
       });
     }
 
+    // No API module matched — serve the frontend (portal.html, via the
+    // Worker's static assets binding) for anything that isn't an /api/ call.
+    if (!url.pathname.startsWith("/api/") && env.ASSETS) {
+      return env.ASSETS.fetch(request);
+    }
+
     return new Response(JSON.stringify({ error: "Not found." }), {
       status: 404,
       headers: { "Content-Type": "application/json", ...corsHeaders() }
