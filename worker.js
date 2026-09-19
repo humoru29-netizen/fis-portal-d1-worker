@@ -3218,7 +3218,7 @@ async function handleResultsRoutes(request, env, url) {
 
     const { results } = await env.DB
       .prepare(
-        `SELECT s.id AS student_id, s.name AS student_name,
+        `SELECT s.id AS student_id, s.name AS student_name, s.admission_no,
                 r.id AS result_id, r.ca1, r.ca2, r.exam, r.grade, r.status
          FROM students s
          LEFT JOIN results r
