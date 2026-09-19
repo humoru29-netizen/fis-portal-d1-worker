@@ -1,0 +1,7 @@
+{
+  "name": "fis-portal-d1-worker",
+  "private": true,
+  "devDependencies": {
+    "wrangler": ">=3.90.0"
+  }
+}
