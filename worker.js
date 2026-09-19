@@ -245,6 +245,10 @@ function isAdminSession(session) {
   return isStaff(session) && ["general_admin", "primary_admin", "secondary_admin"].includes(session.role);
 }
 
+function isGeneralAdmin(session) {
+  return isStaff(session) && session.role === "general_admin";
+}
+
 function isTeachingStaff(session) {
   return isStaff(session) && ["general_admin", "primary_admin", "secondary_admin", "teacher"].includes(session.role);
 }
@@ -3099,7 +3103,125 @@ async function handleAnnouncementRoutes(request, env, url) {
 }
 
 // =====================================================================
-// SECTION 7C: Results routes (score entry + admin approval)
+// SECTION 7B2: Site content routes (public About Us + Leadership Directory)
+// =====================================================================
+/**
+ * FIS Itobe Portal — Worker API (Site Content: About Us + Leadership)
+ *
+ * Routes:
+ *   GET   /api/public/about                    (public) current About Us text
+ *   PUT   /api/settings/about                   (auth: general_admin) { value }
+ *   GET   /api/public/leadership                (public) leadership list, ordered
+ *   GET   /api/leadership                       (auth: general_admin) leadership list (admin management)
+ *   POST  /api/leadership                       (auth: general_admin) { name, title, phone, bio, sortOrder }
+ *   PATCH /api/leadership/:id                   (auth: general_admin) partial update
+ *   DELETE /api/leadership/:id                  (auth: general_admin)
+ */
+async function handleSiteContentRoutes(request, env, url) {
+  const { pathname } = url;
+
+  // ---------------- PUBLIC: ABOUT US ----------------
+  if (pathname === "/api/public/about" && request.method === "GET") {
+    const row = await env.DB.prepare("SELECT value FROM portal_settings WHERE key = 'about_us'").first();
+    return json({ value: row ? row.value : null });
+  }
+
+  // ---------------- ADMIN: SAVE ABOUT US ----------------
+  if (pathname === "/api/settings/about" && request.method === "PUT") {
+    const sessionCtx = await getSession(request, env);
+    if (!isGeneralAdmin(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const { value } = await request.json();
+    if (typeof value !== "string" || !value.trim()) {
+      return json({ error: "value is required." }, 400);
+    }
+
+    await env.DB
+      .prepare(
+        `INSERT INTO portal_settings (key, value) VALUES ('about_us', ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value`
+      )
+      .bind(value.trim())
+      .run();
+
+    return json({ message: "About Us updated." });
+  }
+
+  // ---------------- PUBLIC: LEADERSHIP LIST ----------------
+  if (pathname === "/api/public/leadership" && request.method === "GET") {
+    const { results } = await env.DB
+      .prepare("SELECT id, name, title, phone, bio FROM leadership ORDER BY sort_order ASC, name ASC")
+      .all();
+    return json({ leadership: results });
+  }
+
+  // ---------------- ADMIN: LEADERSHIP LIST (management) ----------------
+  if (pathname === "/api/leadership" && request.method === "GET") {
+    const sessionCtx = await getSession(request, env);
+    if (!isGeneralAdmin(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const { results } = await env.DB
+      .prepare("SELECT id, name, title, phone, bio, sort_order FROM leadership ORDER BY sort_order ASC, name ASC")
+      .all();
+    return json({ leadership: results });
+  }
+
+  // ---------------- ADMIN: ADD LEADER ----------------
+  if (pathname === "/api/leadership" && request.method === "POST") {
+    const sessionCtx = await getSession(request, env);
+    if (!isGeneralAdmin(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const { name, title, phone, bio, sortOrder } = await request.json();
+    if (!name || !title) return json({ error: "name and title are required." }, 400);
+
+    const id = uuid();
+    await env.DB
+      .prepare(
+        "INSERT INTO leadership (id, name, title, phone, bio, sort_order) VALUES (?, ?, ?, ?, ?, ?)"
+      )
+      .bind(id, name, title, phone || null, bio || null, Number.isFinite(sortOrder) ? sortOrder : 0)
+      .run();
+
+    return json({ message: "Leader added.", id });
+  }
+
+  // ---------------- ADMIN: UPDATE LEADER ----------------
+  const updateMatch = pathname.match(/^\/api\/leadership\/([^/]+)$/);
+  if (updateMatch && request.method === "PATCH") {
+    const sessionCtx = await getSession(request, env);
+    if (!isGeneralAdmin(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const existing = await env.DB.prepare("SELECT * FROM leadership WHERE id = ?").bind(updateMatch[1]).first();
+    if (!existing) return json({ error: "Leader not found." }, 404);
+
+    const body = await request.json();
+    const name = body.name !== undefined ? body.name : existing.name;
+    const title = body.title !== undefined ? body.title : existing.title;
+    const phone = body.phone !== undefined ? body.phone : existing.phone;
+    const bio = body.bio !== undefined ? body.bio : existing.bio;
+    const sortOrder = body.sortOrder !== undefined ? body.sortOrder : existing.sort_order;
+
+    await env.DB
+      .prepare("UPDATE leadership SET name = ?, title = ?, phone = ?, bio = ?, sort_order = ? WHERE id = ?")
+      .bind(name, title, phone, bio, sortOrder, updateMatch[1])
+      .run();
+
+    return json({ message: "Leader updated." });
+  }
+
+  // ---------------- ADMIN: DELETE LEADER ----------------
+  if (updateMatch && request.method === "DELETE") {
+    const sessionCtx = await getSession(request, env);
+    if (!isGeneralAdmin(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    await env.DB.prepare("DELETE FROM leadership WHERE id = ?").bind(updateMatch[1]).run();
+    return json({ message: "Leader removed." });
+  }
+
+  return null; // not handled here — let the router try the next module
+}
+
+
 // =====================================================================
 /**
  * FIS Itobe Portal — Worker API (Results: score entry & approval)
@@ -3342,7 +3464,8 @@ const modules = [
   handleReportCardRoutes,
   handleCbtRoutes,
   handleAnnouncementRoutes,
-  handleResultsRoutes
+  handleResultsRoutes,
+  handleSiteContentRoutes
 ];
 
 function corsHeaders() {
