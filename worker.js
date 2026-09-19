@@ -1619,10 +1619,18 @@ async function handleTeacherAssignmentRoutes(request, env, url) {
   // ---------------- LIST ASSIGNMENTS ----------------
   if (pathname === "/api/teacher-assignments" && request.method === "GET") {
     const sessionCtx = await getSession(request, env);
-    if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
+    if (!isTeachingStaff(sessionCtx)) return json({ error: "Not authorised." }, 403);
 
     const teacherId = url.searchParams.get("teacherId");
     const classId = url.searchParams.get("classId");
+
+    // Non-admin (teacher) sessions may only ever look up their own assignments.
+    if (!isAdminSession(sessionCtx)) {
+      if (!teacherId || teacherId !== sessionCtx.id) {
+        return json({ error: "You may only view your own assignments." }, 403);
+      }
+    }
+
     const restriction = adminLevelRestriction(sessionCtx);
 
     let query = `
