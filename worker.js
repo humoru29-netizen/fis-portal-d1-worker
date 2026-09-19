@@ -1561,7 +1561,11 @@ async function handleTeacherAssignmentRoutes(request, env, url) {
     const sessionCtx = await getSession(request, env);
     if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
 
-    const restriction = adminLevelRestriction(sessionCtx);
+    // A genuine primary_admin/secondary_admin account is always scoped to its
+    // own level. A general_admin has no fixed restriction, but the frontend's
+    // Primary View / Secondary View / Overview toggle passes ?level= so the
+    // list still follows whichever level they're currently viewing.
+    const restriction = adminLevelRestriction(sessionCtx) || url.searchParams.get("level");
     const stmt = restriction
       ? env.DB.prepare("SELECT id, name, email, level FROM users WHERE role = 'teacher' AND status = 'active' AND level = ? ORDER BY name").bind(restriction)
       : env.DB.prepare("SELECT id, name, email, level FROM users WHERE role = 'teacher' AND status = 'active' ORDER BY name");
