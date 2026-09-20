@@ -6,5 +6,3 @@ compatibility_date = "2025-01-01"
 binding = "DB"
 database_name = "fis-portal-db"
 database_id = "9521bb8d-ea7a-4f30-aec8-f4ef075ca72a"
-
-[asse
