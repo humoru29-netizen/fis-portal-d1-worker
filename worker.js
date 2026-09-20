@@ -2955,10 +2955,10 @@ async function handleCbtRoutes(request, env, url) {
 // =====================================================================
 /**
  * Routes:
- *   POST   /api/announcements        (auth: admin) { title, body, audience }
+ *   POST   /api/announcements        (auth: general_admin) { title, body, audience }
  *   GET    /api/announcements        (auth: any logged-in) personalised feed
  *   GET    /api/announcements/all    (auth: admin) full unfiltered list, for management
- *   DELETE /api/announcements/:id    (auth: admin)
+ *   DELETE /api/announcements/:id    (auth: general_admin)
  *
  * `audience` is one of: 'all', 'staff', 'teachers', 'students',
  * 'primary', 'secondary', or 'class_<classId>'.
@@ -2990,7 +2990,7 @@ async function handleAnnouncementRoutes(request, env, url) {
   // ---------------- POST AN ANNOUNCEMENT ----------------
   if (pathname === "/api/announcements" && request.method === "POST") {
     const sessionCtx = await getSession(request, env);
-    if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
+    if (!isGeneralAdmin(sessionCtx)) return json({ error: "Not authorised." }, 403);
 
     const { title, body, audience } = await request.json();
     if (!title || !body || !audience) {
@@ -2999,20 +2999,6 @@ async function handleAnnouncementRoutes(request, env, url) {
     const validPrefixes = ["all", "staff", "teachers", "students", "primary", "secondary"];
     if (!validPrefixes.includes(audience) && !audience.startsWith("class_")) {
       return json({ error: "Invalid audience." }, 400);
-    }
-
-    const restriction = adminLevelRestriction(sessionCtx);
-    if (restriction) {
-      const allowedDirect = audience === restriction;
-      const allowedClass = audience.startsWith("class_");
-      if (!allowedDirect && !allowedClass) {
-        return json({ error: `As a ${restriction} admin, you can only post to "${restriction}" or a specific ${restriction} class.` }, 403);
-      }
-      if (allowedClass) {
-        const classId = audience.slice("class_".length);
-        const cls = await env.DB.prepare("SELECT level FROM classes WHERE id = ?").bind(classId).first();
-        if (!cls || cls.level !== restriction) return json({ error: "Not authorised for this class." }, 403);
-      }
     }
 
     const id = uuid();
@@ -3072,20 +3058,7 @@ async function handleAnnouncementRoutes(request, env, url) {
   const deleteMatch = pathname.match(/^\/api\/announcements\/([^/]+)$/);
   if (deleteMatch && request.method === "DELETE") {
     const sessionCtx = await getSession(request, env);
-    if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
-
-    const restriction = adminLevelRestriction(sessionCtx);
-    if (restriction) {
-      const ann = await env.DB.prepare("SELECT audience FROM announcements WHERE id = ?").bind(deleteMatch[1]).first();
-      if (ann) {
-        let allowed = ann.audience === restriction;
-        if (!allowed && ann.audience.startsWith("class_")) {
-          const cls = await env.DB.prepare("SELECT level FROM classes WHERE id = ?").bind(ann.audience.slice("class_".length)).first();
-          allowed = !!cls && cls.level === restriction;
-        }
-        if (!allowed) return json({ error: "Not authorised for this announcement." }, 403);
-      }
-    }
+    if (!isGeneralAdmin(sessionCtx)) return json({ error: "Not authorised." }, 403);
 
     await env.DB.prepare("DELETE FROM announcements WHERE id = ?").bind(deleteMatch[1]).run();
     return json({ message: "Announcement deleted." });
