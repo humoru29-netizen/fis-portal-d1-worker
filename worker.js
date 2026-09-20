@@ -571,6 +571,36 @@ async function handleAttendanceRoutes(request, env, url) {
         if (!cls || cls.level !== restriction) return json({ error: "Not authorised for this class." }, 403);
       }
 
+      // Verify the class itself still exists (catches a stale/removed class id
+      // reaching here from a cached dropdown).
+      const classRow = await env.DB.prepare("SELECT id FROM classes WHERE id = ?").bind(classId).first();
+      if (!classRow) {
+        return json({ error: "This class could not be found. Please refresh the page and try again." }, 404);
+      }
+
+      // Verify every submitted student actually belongs to this class right
+      // now. This is the #1 real-world cause of a FOREIGN KEY error here: the
+      // page loaded a roster, then before saving, one of those students was
+      // moved to a different class, deactivated, or deleted — so their id no
+      // longer matches (class_id, id) together, even though the id itself
+      // still exists somewhere. Catching it here gives a precise, actionable
+      // error instead of a generic database failure.
+      const studentIds = records.map(r => r.studentId);
+      const placeholders = studentIds.map(() => "?").join(",");
+      const { results: matchedStudents } = await env.DB
+        .prepare(`SELECT id, name FROM students WHERE class_id = ? AND id IN (${placeholders})`)
+        .bind(classId, ...studentIds)
+        .all();
+      const matchedIds = new Set(matchedStudents.map(s => s.id));
+      const badIds = studentIds.filter(id => !matchedIds.has(id));
+
+      if (badIds.length) {
+        return json({
+          error: `${badIds.length} student record(s) could not be saved — they may have been moved to a different class or removed. Please refresh the class roster and try again.`,
+          invalidStudentIds: badIds
+        }, 409);
+      }
+
       // Upsert each record — one row per student per date (see UNIQUE constraint)
       const statements = records.map(r =>
         env.DB.prepare(
