@@ -1,4 +1,4 @@
-name = "fiss"
+name = "fis-portal-d1-worker"
 main = "worker.js"
 compatibility_date = "2025-01-01"
 
