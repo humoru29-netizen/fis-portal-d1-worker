@@ -1,4 +1,4 @@
-name = "fiss.itobe.workers.dev"
+name = "fiss"
 main = "worker.js"
 compatibility_date = "2025-01-01"
 
