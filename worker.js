@@ -1289,6 +1289,39 @@ async function handleRosterRoutes(request, env, url) {
     return json({ message: "Student added.", id, admissionNo });
   }
 
+  // ---------------- STUDENT PHOTO: SAVE / CLEAR URL (photo file itself lives in Firebase Storage) ----------------
+  const photoMatch = pathname.match(/^\/api\/students\/([^/]+)\/photo$/);
+  if (photoMatch) {
+    const studentId = photoMatch[1];
+    const sessionCtx = await getSession(request, env);
+    if (!isTeachingStaff(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const student = await env.DB
+      .prepare("SELECT id, level FROM students WHERE id = ?")
+      .bind(studentId)
+      .first();
+    if (!student) return json({ error: "Student not found." }, 404);
+
+    const restriction = adminLevelRestriction(sessionCtx);
+    if (restriction && student.level !== restriction) {
+      return json({ error: "Not authorised for this student." }, 403);
+    }
+
+    if (request.method === "PATCH") {
+      const { photoUrl } = await request.json();
+      if (!photoUrl || typeof photoUrl !== "string") {
+        return json({ error: "photoUrl is required." }, 400);
+      }
+      await env.DB.prepare("UPDATE students SET photo_key = ? WHERE id = ?").bind(photoUrl, studentId).run();
+      return json({ message: "Photo saved." });
+    }
+
+    if (request.method === "DELETE") {
+      await env.DB.prepare("UPDATE students SET photo_key = NULL WHERE id = ?").bind(studentId).run();
+      return json({ message: "Photo removed." });
+    }
+  }
+
   // ---------------- GENERATE STUDENT PIN ----------------
   const pinMatch = pathname.match(/^\/api\/students\/([^/]+)\/pin$/);
   if (pinMatch && request.method === "POST") {
@@ -1725,7 +1758,7 @@ async function handleAdmissionRoutes(request, env, url) {
     const {
       studentName, dob, gender, levelApplied, classApplied,
       guardianName, guardianPhone, guardianEmail, address,
-      priorSchool, healthNotes
+      priorSchool, healthNotes, photoUrl
     } = body;
 
     if (!studentName || !levelApplied || !guardianName || !guardianPhone) {
@@ -1738,13 +1771,13 @@ async function handleAdmissionRoutes(request, env, url) {
         `INSERT INTO admission_applications
            (id, student_name, dob, gender, level_applied, class_applied,
             guardian_name, guardian_phone, guardian_email, address,
-            prior_school, health_notes, raw_form_json, status, submitted_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', datetime('now'))`
+            prior_school, health_notes, photo_url, raw_form_json, status, submitted_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', datetime('now'))`
       )
       .bind(
         id, studentName, dob || null, gender || null, levelApplied, classApplied || null,
         guardianName, guardianPhone, guardianEmail || null, address || null,
-        priorSchool || null, healthNotes || null, JSON.stringify(body)
+        priorSchool || null, healthNotes || null, photoUrl || null, JSON.stringify(body)
       )
       .run();
 
@@ -1763,7 +1796,7 @@ async function handleAdmissionRoutes(request, env, url) {
     let query = `
       SELECT aa.id, aa.student_name, aa.dob, aa.gender, aa.level_applied, aa.class_applied,
              aa.guardian_name, aa.guardian_phone, aa.guardian_email, aa.address,
-             aa.prior_school, aa.health_notes, aa.status, aa.admission_no, aa.assigned_class,
+             aa.prior_school, aa.health_notes, aa.photo_url, aa.status, aa.admission_no, aa.assigned_class,
              c.name AS assigned_class_name,
              aa.submitted_at, aa.decided_by, aa.decided_at
       FROM admission_applications aa
@@ -1830,10 +1863,10 @@ async function handleAdmissionRoutes(request, env, url) {
 
     await env.DB
       .prepare(
-        `INSERT INTO students (id, admission_no, name, class_id, level, guardian_name, guardian_phone, status, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'active', datetime('now'))`
+        `INSERT INTO students (id, admission_no, name, class_id, level, guardian_name, guardian_phone, photo_key, status, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', datetime('now'))`
       )
-      .bind(studentId, admissionNo, application.student_name, classId, targetClass.level, application.guardian_name, application.guardian_phone)
+      .bind(studentId, admissionNo, application.student_name, classId, targetClass.level, application.guardian_name, application.guardian_phone, application.photo_url || null)
       .run();
 
     await env.DB
