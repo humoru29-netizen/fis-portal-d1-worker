@@ -601,19 +601,35 @@ async function handleAttendanceRoutes(request, env, url) {
         }, 409);
       }
 
-      // Upsert each record — one row per student per date (see UNIQUE constraint)
-      const statements = records.map(r =>
-        env.DB.prepare(
-          `INSERT INTO attendance (id, student_id, class_id, date, status, term, session, marked_by)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-           ON CONFLICT(student_id, date) DO UPDATE SET
-             status = excluded.status,
-             marked_by = excluded.marked_by,
-             marked_at = datetime('now')`
-        ).bind(uuid(), r.studentId, classId, date, r.status, term, session, sessionCtx.id)
-      );
+      // Upsert each record — one row per student per date (see UNIQUE constraint).
+      // Inserted sequentially rather than via env.DB.batch(): D1's batch() has
+      // been observed to throw a FOREIGN KEY constraint error even when every
+      // row is individually valid (confirmed here — the same statement run
+      // one at a time via the D1 console succeeded with the exact same ids
+      // that failed inside a batch()). Sequential .run() calls avoid that.
+      let savedCount = 0;
+      for (const r of records) {
+        try {
+          await env.DB
+            .prepare(
+              `INSERT INTO attendance (id, student_id, class_id, date, status, term, session, marked_by)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(student_id, date) DO UPDATE SET
+                 status = excluded.status,
+                 marked_by = excluded.marked_by,
+                 marked_at = datetime('now')`
+            )
+            .bind(uuid(), r.studentId, classId, date, r.status, term, session, sessionCtx.id)
+            .run();
+          savedCount++;
+        } catch (rowErr) {
+          const studentName = (matchedStudents.find(s => s.id === r.studentId) || {}).name || r.studentId;
+          return json({
+            error: `Could not save attendance for ${studentName}: ${rowErr.message || rowErr}. ${savedCount} record(s) before this one were saved successfully.`
+          }, 500);
+        }
+      }
 
-      await env.DB.batch(statements);
       return json({ message: `Attendance saved for ${records.length} student(s).` });
     }
 
