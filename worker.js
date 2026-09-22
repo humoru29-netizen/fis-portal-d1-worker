@@ -2129,7 +2129,7 @@ async function handleFeesRoutes(request, env, url) {
       return json({ error: "amount must be a positive number." }, 400);
     }
 
-    const student = await env.DB.prepare("SELECT id, name, level FROM students WHERE id = ?").bind(studentId).first();
+    const student = await env.DB.prepare("SELECT id, name, admission_no, class_id, level FROM students WHERE id = ?").bind(studentId).first();
     if (!student) return json({ error: "Student not found." }, 404);
 
     const restriction = adminLevelRestriction(sessionCtx);
@@ -2138,16 +2138,45 @@ async function handleFeesRoutes(request, env, url) {
     }
 
     const id = uuid();
+    const recordedAt = new Date().toISOString();
     await env.DB
       .prepare(
         `INSERT INTO fee_transactions
            (id, student_id, student_name_snapshot, amount, type, term, session, recorded_by, recorded_at, notes)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?)`
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
-      .bind(id, studentId, student.name, Number(amount), type, term, session, sessionCtx.id, notes || null)
+      .bind(id, studentId, student.name, Number(amount), type, term, session, sessionCtx.id, recordedAt, notes || null)
       .run();
 
-    return json({ message: "Payment recorded.", id });
+    const structure = await env.DB
+      .prepare("SELECT amount FROM fee_structures WHERE class_id = ? AND term = ? AND session = ?")
+      .bind(student.class_id, term, session)
+      .first();
+    const feeAmount = structure ? structure.amount : 0;
+
+    const paidRow = await env.DB
+      .prepare("SELECT COALESCE(SUM(amount), 0) AS total FROM fee_transactions WHERE student_id = ? AND term = ? AND session = ?")
+      .bind(studentId, term, session)
+      .first();
+    const totalPaid = paidRow.total;
+
+    return json({
+      message: "Payment recorded.",
+      id,
+      receipt: {
+        studentName: student.name,
+        admissionNo: student.admission_no,
+        amount: Number(amount),
+        type,
+        term,
+        session,
+        notes: notes || null,
+        recordedAt,
+        feeAmount,
+        totalPaid,
+        balance: feeAmount - totalPaid
+      }
+    });
   }
 
   // ---------------- STUDENT FEE STATUS + HISTORY ----------------
@@ -2161,7 +2190,7 @@ async function handleFeesRoutes(request, env, url) {
     const session = url.searchParams.get("session");
     if (!term || !session) return json({ error: "term and session are required." }, 400);
 
-    const student = await env.DB.prepare("SELECT id, name, class_id, level FROM students WHERE id = ?").bind(studentId).first();
+    const student = await env.DB.prepare("SELECT id, name, admission_no, class_id, level FROM students WHERE id = ?").bind(studentId).first();
     if (!student) return json({ error: "Student not found." }, 404);
 
     const restriction = adminLevelRestriction(sessionCtx);
@@ -2194,6 +2223,7 @@ async function handleFeesRoutes(request, env, url) {
     return json({
       studentId,
       studentName: student.name,
+      admissionNo: student.admission_no,
       feeAmount,
       totalPaid,
       balance: feeAmount - totalPaid,
