@@ -650,7 +650,7 @@ async function handleAttendanceRoutes(request, env, url) {
 
       const { results } = await env.DB
         .prepare(
-          `SELECT a.student_id, s.name AS student_name, a.status
+          `SELECT s.id AS student_id, s.name AS student_name, a.status
            FROM students s
            LEFT JOIN attendance a ON a.student_id = s.id AND a.date = ?
            WHERE s.class_id = ? AND s.status = 'active'
