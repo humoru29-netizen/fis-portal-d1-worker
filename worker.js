@@ -507,7 +507,8 @@ async function handleStudentAuthRoutes(request, env, url) {
           name: student.name,
           admissionNo: student.admission_no,
           classId: student.class_id,
-          level: student.level
+          level: student.level,
+          photoUrl: student.photo_key || null
         }
       });
     }
@@ -521,7 +522,7 @@ async function handleStudentAuthRoutes(request, env, url) {
       const s = sessionCtx.record;
       return json({
         id: s.id, name: s.name, admissionNo: s.admission_no,
-        classId: s.class_id, level: s.level
+        classId: s.class_id, level: s.level, photoUrl: s.photo_key || null
       });
     }
 
@@ -2337,7 +2338,7 @@ async function handleReportCardRoutes(request, env, url) {
 
     const student = await env.DB
       .prepare(
-        `SELECT s.id, s.name, s.admission_no, s.class_id, c.name AS class_name, c.level
+        `SELECT s.id, s.name, s.admission_no, s.class_id, s.photo_key, c.name AS class_name, c.level
          FROM students s JOIN classes c ON c.id = s.class_id
          WHERE s.id = ?`
       )
@@ -2437,7 +2438,8 @@ async function handleReportCardRoutes(request, env, url) {
         name: student.name,
         admissionNo: student.admission_no,
         className: student.class_name,
-        level: student.level
+        level: student.level,
+        photoUrl: student.photo_key || null
       },
       term,
       session,
