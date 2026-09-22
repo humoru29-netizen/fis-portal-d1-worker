@@ -1218,7 +1218,7 @@ async function handleRosterRoutes(request, env, url) {
   // ---------------- LIST CLASSES ----------------
   if (pathname === "/api/classes" && request.method === "GET") {
     const sessionCtx = await getSession(request, env);
-    if (!isTeachingStaff(sessionCtx) && !isFeeStaff(sessionCtx)) return json({ error: "Not authorised." }, 403);
+    if (!isTeachingStaff(sessionCtx)) return json({ error: "Not authorised." }, 403);
 
     const restriction = adminLevelRestriction(sessionCtx);
     const level = restriction || url.searchParams.get("level");
@@ -1256,7 +1256,7 @@ async function handleRosterRoutes(request, env, url) {
   // ---------------- LIST STUDENTS ----------------
   if (pathname === "/api/students" && request.method === "GET") {
     const sessionCtx = await getSession(request, env);
-    if (!isTeachingStaff(sessionCtx) && !isFeeStaff(sessionCtx)) return json({ error: "Not authorised." }, 403);
+    if (!isTeachingStaff(sessionCtx)) return json({ error: "Not authorised." }, 403);
 
     const restriction = adminLevelRestriction(sessionCtx);
     const classId = url.searchParams.get("classId");
@@ -2183,11 +2183,9 @@ async function handleFeesRoutes(request, env, url) {
   const studentFeeMatch = pathname.match(/^\/api\/fees\/student\/([^/]+)$/);
   if (studentFeeMatch && request.method === "GET") {
     const sessionCtx = await getSession(request, env);
-    const studentIdParam = studentFeeMatch[1];
-    const isSelf = isOwnStudent(sessionCtx, studentIdParam);
-    if (!isFeeStaff(sessionCtx) && !isSelf && !isTeachingStaff(sessionCtx)) return json({ error: "Not authorised." }, 403);
+    if (!isFeeStaff(sessionCtx)) return json({ error: "Not authorised." }, 403);
 
-    const studentId = studentIdParam;
+    const studentId = studentFeeMatch[1];
     const term = url.searchParams.get("term");
     const session = url.searchParams.get("session");
     if (!term || !session) return json({ error: "term and session are required." }, 400);
@@ -2196,7 +2194,7 @@ async function handleFeesRoutes(request, env, url) {
     if (!student) return json({ error: "Student not found." }, 404);
 
     const restriction = adminLevelRestriction(sessionCtx);
-    if (!isSelf && restriction && student.level !== restriction) {
+    if (restriction && student.level !== restriction) {
       return json({ error: "Not authorised for this student." }, 403);
     }
 
@@ -2231,30 +2229,6 @@ async function handleFeesRoutes(request, env, url) {
       balance: feeAmount - totalPaid,
       transactions
     });
-  }
-
-
-  // ---------------- MY OWN FEE HISTORY (student session, no id needed) ----------------
-  if (pathname === "/api/fees/my-history" && request.method === "GET") {
-    const sessionCtx = await getSession(request, env);
-    if (!sessionCtx || sessionCtx.type !== "student") return json({ error: "Not authenticated as student." }, 401);
-    const studentId = sessionCtx.id;
-    const term = url.searchParams.get("term");
-    const session = url.searchParams.get("session");
-    if (!term || !session) return json({ error: "term and session are required." }, 400);
-
-    const student = await env.DB.prepare("SELECT id, name, admission_no, class_id, level FROM students WHERE id = ?").bind(studentId).first();
-    if (!student) return json({ error: "Student not found." }, 404);
-
-    const structure = await env.DB.prepare("SELECT amount FROM fee_structures WHERE class_id = ? AND term = ? AND session = ?").bind(student.class_id, term, session).first();
-    const feeAmount = structure ? structure.amount : 0;
-
-    const paidRow = await env.DB.prepare("SELECT COALESCE(SUM(amount), 0) AS total FROM fee_transactions WHERE student_id = ? AND term = ? AND session = ?").bind(studentId, term, session).first();
-    const totalPaid = paidRow.total;
-
-    const { results: transactions } = await env.DB.prepare(`SELECT id, amount, type, notes, recorded_at FROM fee_transactions WHERE student_id = ? AND term = ? AND session = ? ORDER BY recorded_at DESC`).bind(studentId, term, session).all();
-
-    return json({ studentId, studentName: student.name, admissionNo: student.admission_no, feeAmount, totalPaid, balance: feeAmount - totalPaid, transactions });
   }
 
   // ---------------- CLASS FEE OVERVIEW ----------------
