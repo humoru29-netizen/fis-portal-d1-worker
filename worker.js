@@ -1311,7 +1311,8 @@ async function handleRosterRoutes(request, env, url) {
   if (photoMatch) {
     const studentId = photoMatch[1];
     const sessionCtx = await getSession(request, env);
-    if (!isTeachingStaff(sessionCtx)) return json({ error: "Not authorised." }, 403);
+    const isSelf = sessionCtx && sessionCtx.type === "student" && sessionCtx.id === studentId;
+    if (!isSelf && !isTeachingStaff(sessionCtx)) return json({ error: "Not authorised." }, 403);
 
     const student = await env.DB
       .prepare("SELECT id, level FROM students WHERE id = ?")
@@ -1319,9 +1320,11 @@ async function handleRosterRoutes(request, env, url) {
       .first();
     if (!student) return json({ error: "Student not found." }, 404);
 
-    const restriction = adminLevelRestriction(sessionCtx);
-    if (restriction && student.level !== restriction) {
-      return json({ error: "Not authorised for this student." }, 403);
+    if (!isSelf) {
+      const restriction = adminLevelRestriction(sessionCtx);
+      if (restriction && student.level !== restriction) {
+        return json({ error: "Not authorised for this student." }, 403);
+      }
     }
 
     if (request.method === "PATCH") {
