@@ -3436,8 +3436,46 @@ async function handleResultsRoutes(request, env, url) {
     return json({ students: results });
   }
 
-  // ---------------- LIST PENDING RESULTS FOR A CLASS ----------------
+  // ---------------- LIST PENDING/WITHHELD RESULTS FOR A CLASS ----------------
   if (pathname === "/api/results/pending" && request.method === "GET") {
+    const sessionCtx = await getSession(request, env);
+    if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const classId = url.searchParams.get("classId");
+    const term = url.searchParams.get("term");
+    const session = url.searchParams.get("session");
+    const status = url.searchParams.get("status") || "pending";
+    if (!classId || !term || !session) {
+      return json({ error: "classId, term, and session are required." }, 400);
+    }
+    if (!["pending", "withheld"].includes(status)) {
+      return json({ error: "status must be 'pending' or 'withheld'." }, 400);
+    }
+
+    const restriction = adminLevelRestriction(sessionCtx);
+    if (restriction) {
+      const cls = await env.DB.prepare("SELECT level FROM classes WHERE id = ?").bind(classId).first();
+      if (!cls || cls.level !== restriction) return json({ error: "Not authorised for this class." }, 403);
+    }
+
+    const { results } = await env.DB
+      .prepare(
+        `SELECT r.id, r.ca1, r.ca2, r.exam, r.grade, r.status,
+                s.name AS student_name, sub.name AS subject_name
+         FROM results r
+         JOIN students s ON s.id = r.student_id
+         JOIN subjects sub ON sub.id = r.subject_id
+         WHERE r.class_id = ? AND r.term = ? AND r.session = ? AND r.status = ?
+         ORDER BY s.name, sub.name`
+      )
+      .bind(classId, term, session, status)
+      .all();
+
+    return json({ results });
+  }
+
+  // ---------------- VIEW ALL STUDENTS + THEIR RESULT STATUS FOR A CLASS ----------------
+  if (pathname === "/api/results/student-status" && request.method === "GET") {
     const sessionCtx = await getSession(request, env);
     if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
 
@@ -3454,20 +3492,50 @@ async function handleResultsRoutes(request, env, url) {
       if (!cls || cls.level !== restriction) return json({ error: "Not authorised for this class." }, 403);
     }
 
-    const { results } = await env.DB
+    const { results: rows } = await env.DB
       .prepare(
-        `SELECT r.id, r.ca1, r.ca2, r.exam, r.grade, r.status,
-                s.name AS student_name, sub.name AS subject_name
-         FROM results r
-         JOIN students s ON s.id = r.student_id
-         JOIN subjects sub ON sub.id = r.subject_id
-         WHERE r.class_id = ? AND r.term = ? AND r.session = ? AND r.status = 'pending'
-         ORDER BY s.name, sub.name`
+        `SELECT s.id AS student_id, s.name AS student_name, s.admission_no,
+                r.status
+         FROM students s
+         LEFT JOIN results r
+           ON r.student_id = s.id AND r.class_id = ? AND r.term = ? AND r.session = ?
+         WHERE s.class_id = ? AND s.status = 'active'
+         ORDER BY s.name`
       )
-      .bind(classId, term, session)
+      .bind(classId, term, session, classId)
       .all();
 
-    return json({ results });
+    const byStudent = {};
+    for (const row of rows) {
+      if (!byStudent[row.student_id]) {
+        byStudent[row.student_id] = {
+          student_id: row.student_id,
+          student_name: row.student_name,
+          admission_no: row.admission_no,
+          total: 0,
+          approved: 0,
+          pending: 0,
+          withheld: 0
+        };
+      }
+      if (row.status) {
+        byStudent[row.student_id].total++;
+        byStudent[row.student_id][row.status]++;
+      }
+    }
+
+    const students = Object.values(byStudent).map(st => {
+      let overall = "none"; // no results entered at all
+      if (st.total > 0) {
+        if (st.approved === st.total) overall = "approved";
+        else if (st.withheld === st.total) overall = "withheld";
+        else if (st.pending === st.total) overall = "pending";
+        else overall = "mixed";
+      }
+      return { ...st, overall };
+    });
+
+    return json({ students });
   }
 
   // ---------------- APPROVE / WITHHOLD ONE RESULT ----------------
@@ -3524,6 +3592,94 @@ async function handleResultsRoutes(request, env, url) {
       .run();
 
     return json({ message: "All pending results approved." });
+  }
+
+  // ---------------- RELEASE ALL RESULTS FOR A CLASS/TERM/SESSION ----------------
+  if (pathname === "/api/results/release-class" && request.method === "POST") {
+    const sessionCtx = await getSession(request, env);
+    if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const { classId, term, session } = await request.json();
+    if (!classId || !term || !session) {
+      return json({ error: "classId, term, and session are required." }, 400);
+    }
+
+    const restriction = adminLevelRestriction(sessionCtx);
+    if (restriction) {
+      const cls = await env.DB.prepare("SELECT level FROM classes WHERE id = ?").bind(classId).first();
+      if (!cls || cls.level !== restriction) return json({ error: "Not authorised for this class." }, 403);
+    }
+
+    await env.DB
+      .prepare(
+        `UPDATE results SET status = 'approved', updated_at = datetime('now')
+         WHERE class_id = ? AND term = ? AND session = ?`
+      )
+      .bind(classId, term, session)
+      .run();
+
+    return json({ message: "All results released for this class/term/session." });
+  }
+
+  // ---------------- WITHHOLD ALL RESULTS FOR A CLASS/TERM/SESSION ----------------
+  if (pathname === "/api/results/withhold-class" && request.method === "POST") {
+    const sessionCtx = await getSession(request, env);
+    if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const { classId, term, session } = await request.json();
+    if (!classId || !term || !session) {
+      return json({ error: "classId, term, and session are required." }, 400);
+    }
+
+    const restriction = adminLevelRestriction(sessionCtx);
+    if (restriction) {
+      const cls = await env.DB.prepare("SELECT level FROM classes WHERE id = ?").bind(classId).first();
+      if (!cls || cls.level !== restriction) return json({ error: "Not authorised for this class." }, 403);
+    }
+
+    await env.DB
+      .prepare(
+        `UPDATE results SET status = 'withheld', updated_at = datetime('now')
+         WHERE class_id = ? AND term = ? AND session = ?`
+      )
+      .bind(classId, term, session)
+      .run();
+
+    return json({ message: "All results withheld for this class/term/session." });
+  }
+
+  // ---------------- RELEASE / WITHHOLD ALL RESULTS FOR SELECTED STUDENTS ----------------
+  const resultsBulkStudentsMatch = pathname.match(/^\/api\/results\/(release|withhold)-students$/);
+  if (resultsBulkStudentsMatch && request.method === "POST") {
+    const sessionCtx = await getSession(request, env);
+    if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const action = resultsBulkStudentsMatch[1]; // "release" | "withhold"
+    const newStatus = action === "release" ? "approved" : "withheld";
+
+    const { classId, term, session, studentIds } = await request.json();
+    if (!classId || !term || !session || !Array.isArray(studentIds) || studentIds.length === 0) {
+      return json({ error: "classId, term, session, and at least one studentId are required." }, 400);
+    }
+
+    const restriction = adminLevelRestriction(sessionCtx);
+    if (restriction) {
+      const cls = await env.DB.prepare("SELECT level FROM classes WHERE id = ?").bind(classId).first();
+      if (!cls || cls.level !== restriction) return json({ error: "Not authorised for this class." }, 403);
+    }
+
+    const placeholders = studentIds.map(() => "?").join(",");
+    await env.DB
+      .prepare(
+        `UPDATE results SET status = ?, updated_at = datetime('now')
+         WHERE class_id = ? AND term = ? AND session = ? AND student_id IN (${placeholders})`
+      )
+      .bind(newStatus, classId, term, session, ...studentIds)
+      .run();
+
+    return json({
+      message: `Results ${action === "release" ? "released" : "withheld"} for ${studentIds.length} student${studentIds.length === 1 ? "" : "s"}.`
+    });
   }
 
   return null; // not handled here — let the router try the next module
