@@ -3691,6 +3691,257 @@ async function handleResultsRoutes(request, env, url) {
 }
 
 // =====================================================================
+// SECTION 7J: SMS routes (results notifications + free-text broadcasts)
+// =====================================================================
+/**
+ * Uses Termii (https://termii.com) — Nigeria-focused, pay-as-you-go SMS,
+ * no monthly minimum, generally the cheapest reliable option for
+ * Nigerian-number delivery. Requires two things set in the Worker's
+ * environment before this will actually send anything:
+ *   - TERMII_API_KEY      (Cloudflare Secret — your Termii API key)
+ *   - TERMII_SENDER_ID    (Variable — your registered/approved Sender ID;
+ *                          falls back to Termii's shared "N-Alert" ID,
+ *                          which works immediately but looks generic)
+ * Requires a `sms_log` table (see migration note at the bottom of this
+ * section) — not created automatically, run it once via wrangler/D1 console.
+ *
+ * Routes:
+ *   POST /api/sms/notify-results  (auth: admin)
+ *        { classId, term, session, studentIds?: [] }
+ *        Texts guardians of students who have at least one APPROVED
+ *        result for that term/session. Without studentIds, targets every
+ *        active student in the class with an approved result.
+ *   POST /api/sms/broadcast       (auth: admin)
+ *        { phones: [ "080...", "070..." ], message, label? }
+ *        Sends free-text to any phone numbers typed/pasted in directly —
+ *        for parents, teachers, or anyone else. Not tied to student records.
+ *   GET  /api/sms/log             (auth: admin)
+ *        ?classId=&term=&session=&category=&limit=
+ *        Recent send history for troubleshooting/audit.
+ */
+
+function normalizeNigerianPhone(raw) {
+  let p = String(raw || "").trim().replace(/[^\d+]/g, "");
+  if (p.startsWith("+")) p = p.slice(1);
+  if (p.startsWith("0")) p = "234" + p.slice(1);
+  else if (p.length === 10 && !p.startsWith("234")) p = "234" + p;
+  return p;
+}
+
+async function sendTermiiSms(env, toRaw, message) {
+  const apiKey = env.TERMII_API_KEY;
+  if (!apiKey) return { ok: false, detail: "TERMII_API_KEY is not configured on the Worker." };
+
+  const to = normalizeNigerianPhone(toRaw);
+  if (!to || to.length < 11) return { ok: false, detail: "Invalid phone number: " + toRaw };
+
+  try {
+    const res = await fetch("https://api.ng.termii.com/api/sms/send", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        to,
+        from: env.TERMII_SENDER_ID || "N-Alert",
+        sms: message,
+        type: "plain",
+        channel: "generic",
+        api_key: apiKey
+      })
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data || data.message_id === undefined) {
+      return { ok: false, detail: (data && (data.message || JSON.stringify(data))) || `HTTP ${res.status}` };
+    }
+    return { ok: true, detail: data.message_id };
+  } catch (err) {
+    return { ok: false, detail: String((err && err.message) || err) };
+  }
+}
+
+async function logSms(env, row) {
+  try {
+    await env.DB
+      .prepare(
+        `INSERT INTO sms_log (id, category, recipient_phone, recipient_label, message, status, provider_detail,
+                               student_id, class_id, term, session, sent_by, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))`
+      )
+      .bind(
+        uuid(), row.category, row.phone, row.label || null, row.message, row.status, row.detail || null,
+        row.studentId || null, row.classId || null, row.term || null, row.session || null, row.sentBy || null
+      )
+      .run();
+  } catch (err) {
+    // Logging failures shouldn't block the actual send response — the
+    // sms_log table may not exist yet (see migration note above).
+  }
+}
+
+async function handleSmsRoutes(request, env, url) {
+  const { pathname } = url;
+
+  // ---------------- NOTIFY PARENTS OF RELEASED RESULTS ----------------
+  if (pathname === "/api/sms/notify-results" && request.method === "POST") {
+    const sessionCtx = await getSession(request, env);
+    if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const { classId, term, session, studentIds } = await request.json();
+    if (!classId || !term || !session) {
+      return json({ error: "classId, term, and session are required." }, 400);
+    }
+
+    const restriction = adminLevelRestriction(sessionCtx);
+    const cls = await env.DB.prepare("SELECT id, name, level FROM classes WHERE id = ?").bind(classId).first();
+    if (!cls) return json({ error: "Class not found." }, 404);
+    if (restriction && cls.level !== restriction) return json({ error: "Not authorised for this class." }, 403);
+
+    let students;
+    if (Array.isArray(studentIds) && studentIds.length > 0) {
+      const placeholders = studentIds.map(() => "?").join(",");
+      const { results } = await env.DB
+        .prepare(`SELECT id, name, guardian_phone FROM students WHERE class_id = ? AND id IN (${placeholders})`)
+        .bind(classId, ...studentIds)
+        .all();
+      students = results;
+    } else {
+      const { results } = await env.DB
+        .prepare("SELECT id, name, guardian_phone FROM students WHERE class_id = ? AND status = 'active'")
+        .bind(classId)
+        .all();
+      students = results;
+    }
+
+    if (!students.length) return json({ error: "No matching students found." }, 404);
+
+    const sent = [];
+    const failed = [];
+    const skipped = [];
+
+    for (const stu of students) {
+      const approvedRow = await env.DB
+        .prepare(
+          `SELECT COUNT(*) AS count FROM results
+           WHERE student_id = ? AND class_id = ? AND term = ? AND session = ? AND status = 'approved'`
+        )
+        .bind(stu.id, classId, term, session)
+        .first();
+
+      if (!approvedRow || approvedRow.count === 0) {
+        skipped.push({ studentId: stu.id, name: stu.name, reason: "No released result for this term/session." });
+        continue;
+      }
+      if (!stu.guardian_phone) {
+        skipped.push({ studentId: stu.id, name: stu.name, reason: "No guardian phone number on file." });
+        continue;
+      }
+
+      const message = `Dear Parent, the ${term} (${session}) result for ${stu.name} (${cls.name}) has been released. Please log in to the school portal to view/print it. - ${env.SCHOOL_NAME || "Faith International Schools, Itobe"}`;
+
+      const result = await sendTermiiSms(env, stu.guardian_phone, message);
+      await logSms(env, {
+        category: "results", phone: stu.guardian_phone, label: stu.name, message,
+        status: result.ok ? "sent" : "failed", detail: result.detail,
+        studentId: stu.id, classId, term, session, sentBy: sessionCtx.id
+      });
+
+      if (result.ok) sent.push({ studentId: stu.id, name: stu.name });
+      else failed.push({ studentId: stu.id, name: stu.name, reason: result.detail });
+    }
+
+    return json({
+      message: `Sent ${sent.length}, failed ${failed.length}, skipped ${skipped.length}.`,
+      sent, failed, skipped
+    });
+  }
+
+  // ---------------- FREE-TEXT BROADCAST TO PROVIDED NUMBERS ----------------
+  if (pathname === "/api/sms/broadcast" && request.method === "POST") {
+    const sessionCtx = await getSession(request, env);
+    if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const { phones, message, label } = await request.json();
+    if (!Array.isArray(phones) || phones.length === 0 || !message || !message.trim()) {
+      return json({ error: "phones (non-empty array) and message are required." }, 400);
+    }
+
+    const uniquePhones = [...new Set(phones.map(p => String(p || "").trim()).filter(Boolean))];
+    if (!uniquePhones.length) return json({ error: "No valid phone numbers provided." }, 400);
+
+    const sent = [];
+    const failed = [];
+
+    for (const phone of uniquePhones) {
+      const result = await sendTermiiSms(env, phone, message);
+      await logSms(env, {
+        category: "broadcast", phone, label: label || null, message,
+        status: result.ok ? "sent" : "failed", detail: result.detail,
+        sentBy: sessionCtx.id
+      });
+      if (result.ok) sent.push(phone);
+      else failed.push({ phone, reason: result.detail });
+    }
+
+    return json({
+      message: `Sent ${sent.length}, failed ${failed.length}.`,
+      sent, failed
+    });
+  }
+
+  // ---------------- SEND LOG ----------------
+  if (pathname === "/api/sms/log" && request.method === "GET") {
+    const sessionCtx = await getSession(request, env);
+    if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const classId = url.searchParams.get("classId");
+    const term = url.searchParams.get("term");
+    const session = url.searchParams.get("session");
+    const category = url.searchParams.get("category");
+    const limit = Math.min(parseInt(url.searchParams.get("limit") || "50", 10) || 50, 200);
+
+    const conditions = [];
+    const binds = [];
+    if (classId) { conditions.push("class_id = ?"); binds.push(classId); }
+    if (term) { conditions.push("term = ?"); binds.push(term); }
+    if (session) { conditions.push("session = ?"); binds.push(session); }
+    if (category) { conditions.push("category = ?"); binds.push(category); }
+    const where = conditions.length ? "WHERE " + conditions.join(" AND ") : "";
+
+    try {
+      const { results } = await env.DB
+        .prepare(`SELECT * FROM sms_log ${where} ORDER BY created_at DESC LIMIT ${limit}`)
+        .bind(...binds)
+        .all();
+      return json({ log: results });
+    } catch (err) {
+      return json({ error: "sms_log table not found — run the migration first.", detail: String((err && err.message) || err) }, 500);
+    }
+  }
+
+  return null; // not handled here — let the router try the next module
+}
+
+/**
+ * One-time D1 migration for the sms_log table (run via wrangler or the
+ * Cloudflare D1 console — this file only queries it, it never creates it):
+ *
+ * CREATE TABLE sms_log (
+ *   id TEXT PRIMARY KEY,
+ *   category TEXT NOT NULL,             -- 'results' | 'broadcast'
+ *   recipient_phone TEXT NOT NULL,
+ *   recipient_label TEXT,               -- student/contact name, if known
+ *   message TEXT NOT NULL,
+ *   status TEXT NOT NULL,               -- 'sent' | 'failed'
+ *   provider_detail TEXT,               -- Termii message_id, or error text
+ *   student_id TEXT,
+ *   class_id TEXT,
+ *   term TEXT,
+ *   session TEXT,
+ *   sent_by TEXT,
+ *   created_at TEXT NOT NULL
+ * );
+ */
+
+// =====================================================================
 // SECTION 8: Entry point — routes across all sections above
 // =====================================================================
 const modules = [
@@ -3708,7 +3959,8 @@ const modules = [
   handleCbtRoutes,
   handleAnnouncementRoutes,
   handleResultsRoutes,
-  handleSiteContentRoutes
+  handleSiteContentRoutes,
+  handleSmsRoutes
 ];
 
 function corsHeaders() {
