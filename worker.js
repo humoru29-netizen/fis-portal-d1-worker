@@ -2414,7 +2414,10 @@ async function handleReportCardRoutes(request, env, url) {
 
     const pendingRow = await env.DB
       .prepare(
-        `SELECT COUNT(*) AS count FROM results
+        `SELECT
+           SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pending_count,
+           SUM(CASE WHEN status = 'withheld' THEN 1 ELSE 0 END) AS withheld_count
+         FROM results
          WHERE student_id = ? AND term = ? AND session = ? AND status != 'approved'`
       )
       .bind(studentId, term, session)
@@ -2482,7 +2485,9 @@ async function handleReportCardRoutes(request, env, url) {
       subjects,
       overallTotal,
       average,
-      pendingSubjectCount: pendingRow.count,
+      pendingSubjectCount: (pendingRow.pending_count || 0) + (pendingRow.withheld_count || 0),
+      pendingCount: pendingRow.pending_count || 0,
+      withheldCount: pendingRow.withheld_count || 0,
       position,
       outOf,
       attendance: {
