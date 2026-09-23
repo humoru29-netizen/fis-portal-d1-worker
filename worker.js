@@ -2040,7 +2040,7 @@ async function handleManageAccountsRoutes(request, env, url) {
  *   POST /api/fee-structures                  (auth: admin) set/update the fee amount for a class/term/session
  *   GET  /api/fee-structures?term=&session=   (auth: cashier/admin) list fee amount per class for a term
  *   POST /api/fees/payments                   (auth: cashier/admin) record a payment — ALWAYS live, never queued offline
- *   GET  /api/fees/student/:studentId?term=&session=  (auth: cashier/admin) fee owed, paid, balance, and payment history
+ *   GET  /api/fees/student/:studentId?term=&session=  (auth: cashier/admin, or the student viewing their own) fee owed, paid, balance, and payment history
  *   GET  /api/fees/class/:classId?term=&session=      (auth: cashier/admin) per-student paid/balance for a class
  *   GET  /api/fees/totals?term=&session=              (auth: cashier/admin) amount collected today/this week/this month/this term
  */
@@ -2183,9 +2183,10 @@ async function handleFeesRoutes(request, env, url) {
   const studentFeeMatch = pathname.match(/^\/api\/fees\/student\/([^/]+)$/);
   if (studentFeeMatch && request.method === "GET") {
     const sessionCtx = await getSession(request, env);
-    if (!isFeeStaff(sessionCtx)) return json({ error: "Not authorised." }, 403);
-
     const studentId = studentFeeMatch[1];
+    const isSelf = sessionCtx && sessionCtx.type === "student" && sessionCtx.id === studentId;
+    if (!isSelf && !isFeeStaff(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
     const term = url.searchParams.get("term");
     const session = url.searchParams.get("session");
     if (!term || !session) return json({ error: "term and session are required." }, 400);
@@ -2193,9 +2194,11 @@ async function handleFeesRoutes(request, env, url) {
     const student = await env.DB.prepare("SELECT id, name, admission_no, class_id, level FROM students WHERE id = ?").bind(studentId).first();
     if (!student) return json({ error: "Student not found." }, 404);
 
-    const restriction = adminLevelRestriction(sessionCtx);
-    if (restriction && student.level !== restriction) {
-      return json({ error: "Not authorised for this student." }, 403);
+    if (!isSelf) {
+      const restriction = adminLevelRestriction(sessionCtx);
+      if (restriction && student.level !== restriction) {
+        return json({ error: "Not authorised for this student." }, 403);
+      }
     }
 
     const structure = await env.DB
