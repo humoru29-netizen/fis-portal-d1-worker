@@ -1178,6 +1178,8 @@ async function handleAssignmentRoutes(request, env, url) {
  *   DELETE /api/subjects/:id          (auth: admin) delete a subject
  *   DELETE /api/students/:id          (auth: admin) soft-delete a student (sets status to inactive,
  *        preserving their attendance/assignment/PIN history)
+ *   PATCH  /api/students/:id          (auth: admin) edit an active student's core details
+ *        body: { name, classId, sessionJoined, guardianName, guardianPhone }
  */
 
 /**
@@ -1584,8 +1586,52 @@ async function handleRosterRoutes(request, env, url) {
     return json({ message: "Subject deleted." });
   }
 
-  // ---------------- REMOVE STUDENT (soft delete) ----------------
+  // ---------------- EDIT / REMOVE STUDENT ----------------
   const studentDetailMatch = pathname.match(/^\/api\/students\/([^/]+)$/);
+
+  if (studentDetailMatch && request.method === "PATCH") {
+    const sessionCtx = await getSession(request, env);
+    if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const studentId = studentDetailMatch[1];
+    const student = await env.DB
+      .prepare("SELECT id, level FROM students WHERE id = ? AND status = 'active'")
+      .bind(studentId)
+      .first();
+    if (!student) return json({ error: "Student not found." }, 404);
+
+    const restriction = adminLevelRestriction(sessionCtx);
+    if (restriction && student.level !== restriction) {
+      return json({ error: "Not authorised for this student." }, 403);
+    }
+
+    const { name, classId, sessionJoined, guardianName, guardianPhone } = await request.json();
+    if (!name || !classId) {
+      return json({ error: "name and classId are required." }, 400);
+    }
+
+    // If moving the student to a different class, that class must be within
+    // the admin's level restriction too (a level admin can't move a student
+    // into the other level's class).
+    let newLevel = student.level;
+    const targetClass = await env.DB.prepare("SELECT level FROM classes WHERE id = ?").bind(classId).first();
+    if (!targetClass) return json({ error: "Class not found." }, 404);
+    if (restriction && targetClass.level !== restriction) {
+      return json({ error: `As a ${restriction} admin, you can only assign ${restriction} classes.` }, 403);
+    }
+    newLevel = targetClass.level;
+
+    await env.DB
+      .prepare(
+        `UPDATE students SET name = ?, class_id = ?, level = ?, session_joined = ?, guardian_name = ?, guardian_phone = ?
+         WHERE id = ?`
+      )
+      .bind(name, classId, newLevel, sessionJoined || null, guardianName || null, guardianPhone || null, studentId)
+      .run();
+
+    return json({ message: "Student updated." });
+  }
+
   if (studentDetailMatch && request.method === "DELETE") {
     const sessionCtx = await getSession(request, env);
     if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
@@ -3820,6 +3866,31 @@ async function handleSmsRoutes(request, env, url) {
 
     if (!students.length) return json({ error: "No matching students found." }, 404);
 
+    // Class-wide averages (approved results only) — used to compute each
+    // student's average score and rank/position, same logic as the report card.
+    const { results: classAverages } = await env.DB
+      .prepare(
+        `SELECT student_id, AVG(ca1 + ca2 + exam) AS avg_score
+         FROM results
+         WHERE class_id = ? AND term = ? AND session = ? AND status = 'approved'
+         GROUP BY student_id
+         ORDER BY avg_score DESC`
+      )
+      .bind(classId, term, session)
+      .all();
+
+    const outOf = classAverages.length;
+    const rankById = {};
+    classAverages.forEach((row, idx) => { rankById[row.student_id] = idx + 1; });
+    const avgById = {};
+    classAverages.forEach(row => { avgById[row.student_id] = row.avg_score; });
+
+    function ordinal(n) {
+      const s = ["th", "st", "nd", "rd"];
+      const v = n % 100;
+      return n + (s[(v - 20) % 10] || s[v] || s[0]);
+    }
+
     const sent = [];
     const failed = [];
     const skipped = [];
@@ -3842,7 +3913,13 @@ async function handleSmsRoutes(request, env, url) {
         continue;
       }
 
-      const message = `Dear Parent, the ${term} (${session}) result for ${stu.name} (${cls.name}) has been released. Please log in to the school portal to view/print it. - ${env.SCHOOL_NAME || "Faith International Schools, Itobe"}`;
+      const avg = avgById[stu.id];
+      const position = rankById[stu.id];
+      const summary = (avg !== undefined && position)
+        ? ` Avg: ${avg.toFixed(1)}%, Position: ${ordinal(position)} of ${outOf}.`
+        : "";
+
+      const message = `${term} (${session}) result for ${stu.name} (${cls.name}) is out.${summary} View full result on the school portal.`;
 
       const result = await sendTermiiSms(env, stu.guardian_phone, message);
       await logSms(env, {
