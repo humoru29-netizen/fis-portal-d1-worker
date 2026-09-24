@@ -1987,7 +1987,7 @@ async function handleManageAccountsRoutes(request, env, url) {
 
     const { results } = await env.DB
       .prepare(
-        `SELECT id, name, email, role, level, status, created_at, approved_by, approved_at
+        `SELECT id, name, email, phone, role, level, status, created_at, approved_by, approved_at
          FROM users WHERE status IN ('active', 'suspended') ORDER BY name`
       )
       .all();
@@ -2017,6 +2017,23 @@ async function handleManageAccountsRoutes(request, env, url) {
       .run();
 
     return json({ message: "Account updated." });
+  }
+
+  // ---------------- SET/UPDATE PHONE (used for SMS notifications) ----------------
+  const phoneMatch = pathname.match(/^\/api\/staff\/([^/]+)\/phone$/);
+  if (phoneMatch && request.method === "PATCH") {
+    const sessionCtx = await getSession(request, env);
+    if (!isGeneralAdmin(sessionCtx)) return json({ error: "Not authorised. Only the General Admin can manage accounts." }, 403);
+
+    const staffId = phoneMatch[1];
+    const { phone } = await request.json();
+
+    const target = await env.DB.prepare("SELECT id FROM users WHERE id = ?").bind(staffId).first();
+    if (!target) return json({ error: "Account not found." }, 404);
+
+    await env.DB.prepare("UPDATE users SET phone = ? WHERE id = ?").bind(phone ? String(phone).trim() : null, staffId).run();
+
+    return json({ message: "Phone number saved." });
   }
 
   // ---------------- SUSPEND / REACTIVATE ----------------
@@ -3760,6 +3777,16 @@ async function handleResultsRoutes(request, env, url) {
  *        Texts guardians of students who have at least one APPROVED
  *        result for that term/session. Without studentIds, targets every
  *        active student in the class with an approved result.
+ *   POST /api/sms/notify-fees     (auth: cashier/admin)
+ *        { classId, term, session, studentIds?: [] }
+ *        Texts guardians of students with an outstanding fee balance
+ *        (feeAmount - totalPaid > 0) for that term/session. Without
+ *        studentIds, targets every active student in the class.
+ *   POST /api/sms/notify-teachers (auth: admin)
+ *        { staffIds?: [], message }
+ *        Texts active teachers their registered phone number (users.phone).
+ *        Without staffIds, targets every active teacher. Staff with no
+ *        phone on file are skipped and listed, same as the other routes.
  *   POST /api/sms/broadcast       (auth: admin)
  *        { phones: [ "080...", "070..." ], message, label? }
  *        Sends free-text to any phone numbers typed/pasted in directly —
@@ -3931,6 +3958,138 @@ async function handleSmsRoutes(request, env, url) {
     });
   }
 
+  // ---------------- NOTIFY PARENTS OF OUTSTANDING FEE BALANCES ----------------
+  if (pathname === "/api/sms/notify-fees" && request.method === "POST") {
+    const sessionCtx = await getSession(request, env);
+    if (!isFeeStaff(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const { classId, term, session, studentIds } = await request.json();
+    if (!classId || !term || !session) {
+      return json({ error: "classId, term, and session are required." }, 400);
+    }
+
+    const restriction = adminLevelRestriction(sessionCtx);
+    const cls = await env.DB.prepare("SELECT id, name, level FROM classes WHERE id = ?").bind(classId).first();
+    if (!cls) return json({ error: "Class not found." }, 404);
+    if (restriction && cls.level !== restriction) return json({ error: "Not authorised for this class." }, 403);
+
+    const structure = await env.DB
+      .prepare("SELECT amount FROM fee_structures WHERE class_id = ? AND term = ? AND session = ?")
+      .bind(classId, term, session)
+      .first();
+    const feeAmount = structure ? structure.amount : 0;
+
+    let students;
+    if (Array.isArray(studentIds) && studentIds.length > 0) {
+      const placeholders = studentIds.map(() => "?").join(",");
+      const { results } = await env.DB
+        .prepare(`SELECT id, name, guardian_phone FROM students WHERE class_id = ? AND id IN (${placeholders})`)
+        .bind(classId, ...studentIds)
+        .all();
+      students = results;
+    } else {
+      const { results } = await env.DB
+        .prepare("SELECT id, name, guardian_phone FROM students WHERE class_id = ? AND status = 'active'")
+        .bind(classId)
+        .all();
+      students = results;
+    }
+
+    if (!students.length) return json({ error: "No matching students found." }, 404);
+
+    const sent = [];
+    const failed = [];
+    const skipped = [];
+
+    for (const stu of students) {
+      const paidRow = await env.DB
+        .prepare("SELECT COALESCE(SUM(amount), 0) AS total FROM fee_transactions WHERE student_id = ? AND term = ? AND session = ?")
+        .bind(stu.id, term, session)
+        .first();
+      const balance = feeAmount - paidRow.total;
+
+      if (balance <= 0) {
+        skipped.push({ studentId: stu.id, name: stu.name, reason: "No outstanding balance." });
+        continue;
+      }
+      if (!stu.guardian_phone) {
+        skipped.push({ studentId: stu.id, name: stu.name, reason: "No guardian phone number on file." });
+        continue;
+      }
+
+      const message = `Fee reminder: ${stu.name} (${cls.name}) has an outstanding balance of NGN ${balance.toLocaleString()} for ${term} (${session}). Kindly clear at your earliest convenience. - Faith International Schools, Itobe`;
+
+      const result = await sendKudiSms(env, stu.guardian_phone, message);
+      await logSms(env, {
+        category: "fees", phone: stu.guardian_phone, label: stu.name, message,
+        status: result.ok ? "sent" : "failed", detail: result.detail,
+        studentId: stu.id, classId, term, session, sentBy: sessionCtx.id
+      });
+
+      if (result.ok) sent.push({ studentId: stu.id, name: stu.name, balance });
+      else failed.push({ studentId: stu.id, name: stu.name, reason: result.detail });
+    }
+
+    return json({
+      message: `Sent ${sent.length}, failed ${failed.length}, skipped ${skipped.length}.`,
+      sent, failed, skipped
+    });
+  }
+
+  // ---------------- NOTIFY TEACHERS (GENERAL ANNOUNCEMENTS) ----------------
+  if (pathname === "/api/sms/notify-teachers" && request.method === "POST") {
+    const sessionCtx = await getSession(request, env);
+    if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const { staffIds, message } = await request.json();
+    if (!message || !message.trim()) {
+      return json({ error: "message is required." }, 400);
+    }
+
+    let teachers;
+    if (Array.isArray(staffIds) && staffIds.length > 0) {
+      const placeholders = staffIds.map(() => "?").join(",");
+      const { results } = await env.DB
+        .prepare(`SELECT id, name, phone FROM users WHERE role = 'teacher' AND status = 'active' AND id IN (${placeholders})`)
+        .bind(...staffIds)
+        .all();
+      teachers = results;
+    } else {
+      const { results } = await env.DB
+        .prepare("SELECT id, name, phone FROM users WHERE role = 'teacher' AND status = 'active'")
+        .all();
+      teachers = results;
+    }
+
+    if (!teachers.length) return json({ error: "No matching teachers found." }, 404);
+
+    const sent = [];
+    const failed = [];
+    const skipped = [];
+
+    for (const t of teachers) {
+      if (!t.phone) {
+        skipped.push({ staffId: t.id, name: t.name, reason: "No phone number on file." });
+        continue;
+      }
+
+      const result = await sendKudiSms(env, t.phone, message);
+      await logSms(env, {
+        category: "teachers", phone: t.phone, label: t.name, message,
+        status: result.ok ? "sent" : "failed", detail: result.detail,
+        sentBy: sessionCtx.id
+      });
+
+      if (result.ok) sent.push({ staffId: t.id, name: t.name });
+      else failed.push({ staffId: t.id, name: t.name, reason: result.detail });
+    }
+
+    return json({
+      message: `Sent ${sent.length}, failed ${failed.length}, skipped ${skipped.length}.`,
+      sent, failed, skipped
+    });
+  }
+
   // ---------------- FREE-TEXT BROADCAST TO PROVIDED NUMBERS ----------------
   if (pathname === "/api/sms/broadcast" && request.method === "POST") {
     const sessionCtx = await getSession(request, env);
@@ -4003,7 +4162,7 @@ async function handleSmsRoutes(request, env, url) {
  *
  * CREATE TABLE sms_log (
  *   id TEXT PRIMARY KEY,
- *   category TEXT NOT NULL,             -- 'results' | 'broadcast'
+ *   category TEXT NOT NULL,             -- 'results' | 'fees' | 'teachers' | 'broadcast'
  *   recipient_phone TEXT NOT NULL,
  *   recipient_label TEXT,               -- student/contact name, if known
  *   message TEXT NOT NULL,
@@ -4016,6 +4175,11 @@ async function handleSmsRoutes(request, env, url) {
  *   sent_by TEXT,
  *   created_at TEXT NOT NULL
  * );
+ *
+ * One-time D1 migration to add a phone column to users (needed so
+ * teachers can be texted via /api/sms/notify-teachers):
+ *
+ * ALTER TABLE users ADD COLUMN phone TEXT;
  */
 
 // =====================================================================
