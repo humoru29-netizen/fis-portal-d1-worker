@@ -3772,26 +3772,26 @@ async function handleResultsRoutes(request, env, url) {
  * section) — not created automatically, run it once via wrangler/D1 console.
  *
  * Routes:
- *   POST /api/sms/notify-results  (auth: admin)
+ *   POST /api/sms/notify-results  (auth: general_admin only)
  *        { classId, term, session, studentIds?: [] }
  *        Texts guardians of students who have at least one APPROVED
  *        result for that term/session. Without studentIds, targets every
  *        active student in the class with an approved result.
- *   POST /api/sms/notify-fees     (auth: cashier/admin)
+ *   POST /api/sms/notify-fees     (auth: general_admin only)
  *        { classId, term, session, studentIds?: [] }
  *        Texts guardians of students with an outstanding fee balance
  *        (feeAmount - totalPaid > 0) for that term/session. Without
  *        studentIds, targets every active student in the class.
- *   POST /api/sms/notify-teachers (auth: admin)
+ *   POST /api/sms/notify-teachers (auth: general_admin only)
  *        { staffIds?: [], message }
  *        Texts active teachers their registered phone number (users.phone).
  *        Without staffIds, targets every active teacher. Staff with no
  *        phone on file are skipped and listed, same as the other routes.
- *   POST /api/sms/broadcast       (auth: admin)
+ *   POST /api/sms/broadcast       (auth: general_admin only)
  *        { phones: [ "080...", "070..." ], message, label? }
  *        Sends free-text to any phone numbers typed/pasted in directly —
  *        for parents, teachers, or anyone else. Not tied to student records.
- *   GET  /api/sms/log             (auth: admin)
+ *   GET  /api/sms/log             (auth: general_admin only)
  *        ?classId=&term=&session=&category=&limit=
  *        Recent send history for troubleshooting/audit.
  */
@@ -3856,7 +3856,7 @@ async function handleSmsRoutes(request, env, url) {
   // ---------------- NOTIFY PARENTS OF RELEASED RESULTS ----------------
   if (pathname === "/api/sms/notify-results" && request.method === "POST") {
     const sessionCtx = await getSession(request, env);
-    if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
+    if (!isGeneralAdmin(sessionCtx)) return json({ error: "Not authorised. SMS is restricted to the General Admin." }, 403);
 
     const { classId, term, session, studentIds } = await request.json();
     if (!classId || !term || !session) {
@@ -3961,7 +3961,7 @@ async function handleSmsRoutes(request, env, url) {
   // ---------------- NOTIFY PARENTS OF OUTSTANDING FEE BALANCES ----------------
   if (pathname === "/api/sms/notify-fees" && request.method === "POST") {
     const sessionCtx = await getSession(request, env);
-    if (!isFeeStaff(sessionCtx)) return json({ error: "Not authorised." }, 403);
+    if (!isGeneralAdmin(sessionCtx)) return json({ error: "Not authorised. SMS is restricted to the General Admin." }, 403);
 
     const { classId, term, session, studentIds } = await request.json();
     if (!classId || !term || !session) {
@@ -4039,7 +4039,7 @@ async function handleSmsRoutes(request, env, url) {
   // ---------------- NOTIFY TEACHERS (GENERAL ANNOUNCEMENTS) ----------------
   if (pathname === "/api/sms/notify-teachers" && request.method === "POST") {
     const sessionCtx = await getSession(request, env);
-    if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
+    if (!isGeneralAdmin(sessionCtx)) return json({ error: "Not authorised. SMS is restricted to the General Admin." }, 403);
 
     const { staffIds, message } = await request.json();
     if (!message || !message.trim()) {
@@ -4093,7 +4093,7 @@ async function handleSmsRoutes(request, env, url) {
   // ---------------- FREE-TEXT BROADCAST TO PROVIDED NUMBERS ----------------
   if (pathname === "/api/sms/broadcast" && request.method === "POST") {
     const sessionCtx = await getSession(request, env);
-    if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
+    if (!isGeneralAdmin(sessionCtx)) return json({ error: "Not authorised. SMS is restricted to the General Admin." }, 403);
 
     const { phones, message, label } = await request.json();
     if (!Array.isArray(phones) || phones.length === 0 || !message || !message.trim()) {
@@ -4126,7 +4126,7 @@ async function handleSmsRoutes(request, env, url) {
   // ---------------- SEND LOG ----------------
   if (pathname === "/api/sms/log" && request.method === "GET") {
     const sessionCtx = await getSession(request, env);
-    if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
+    if (!isGeneralAdmin(sessionCtx)) return json({ error: "Not authorised. SMS is restricted to the General Admin." }, 403);
 
     const classId = url.searchParams.get("classId");
     const term = url.searchParams.get("term");
