@@ -3698,10 +3698,17 @@ async function handleResultsRoutes(request, env, url) {
  * no monthly minimum, generally the cheapest reliable option for
  * Nigerian-number delivery. Requires two things set in the Worker's
  * environment before this will actually send anything:
- *   - TERMII_API_KEY      (Cloudflare Secret — your Termii API key)
+ * *   - TERMII_API_KEY      (Cloudflare Secret — your Termii API key)
  *   - TERMII_SENDER_ID    (Variable — your registered/approved Sender ID;
  *                          falls back to Termii's shared "N-Alert" ID,
  *                          which works immediately but looks generic)
+ * Currently sends on Termii's "generic" channel (base URL
+ * v4.api.termii.com). Note: generic does not deliver to numbers on
+ * Do-Not-Disturb and is blocked for MTN numbers 8PM-8AM WAT. For
+ * reliable delivery of transactional messages (like a result being
+ * released) Termii recommends the "dnd" channel instead — that needs
+ * to be activated by contacting Termii support first; once it is,
+ * change `channel: "generic"` to `channel: "dnd"` in sendTermiiSms below.
  * Requires a `sms_log` table (see migration note at the bottom of this
  * section) — not created automatically, run it once via wrangler/D1 console.
  *
@@ -3736,7 +3743,7 @@ async function sendTermiiSms(env, toRaw, message) {
   if (!to || to.length < 11) return { ok: false, detail: "Invalid phone number: " + toRaw };
 
   try {
-    const res = await fetch("https://api.ng.termii.com/api/sms/send", {
+    const res = await fetch("https://v4.api.termii.com/api/sms/send", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -3749,7 +3756,7 @@ async function sendTermiiSms(env, toRaw, message) {
       })
     });
     const data = await res.json().catch(() => ({}));
-    if (!res.ok || !data || data.message_id === undefined) {
+    if (!res.ok || !data || data.code !== "ok") {
       return { ok: false, detail: (data && (data.message || JSON.stringify(data))) || `HTTP ${res.status}` };
     }
     return { ok: true, detail: data.message_id };
