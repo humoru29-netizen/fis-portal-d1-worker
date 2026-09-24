@@ -3740,21 +3740,17 @@ async function handleResultsRoutes(request, env, url) {
 // SECTION 7J: SMS routes (results notifications + free-text broadcasts)
 // =====================================================================
 /**
- * Uses Termii (https://termii.com) — Nigeria-focused, pay-as-you-go SMS,
- * no monthly minimum, generally the cheapest reliable option for
- * Nigerian-number delivery. Requires two things set in the Worker's
- * environment before this will actually send anything:
- * *   - TERMII_API_KEY      (Cloudflare Secret — your Termii API key)
- *   - TERMII_SENDER_ID    (Variable — your registered/approved Sender ID;
- *                          falls back to Termii's shared "N-Alert" ID,
- *                          which works immediately but looks generic)
- * Currently sends on Termii's "generic" channel (base URL
- * v4.api.termii.com). Note: generic does not deliver to numbers on
- * Do-Not-Disturb and is blocked for MTN numbers 8PM-8AM WAT. For
- * reliable delivery of transactional messages (like a result being
- * released) Termii recommends the "dnd" channel instead — that needs
- * to be activated by contacting Termii support first; once it is,
- * change `channel: "generic"` to `channel: "dnd"` in sendTermiiSms below.
+ * Uses KudiSMS (https://kudisms.net) — Nigeria-focused bulk SMS API.
+ * Requires two things set in the Worker's environment before this will
+ * actually send anything:
+ *   - KUDISMS_API_KEY     (Cloudflare Secret — your KudiSMS API token)
+ *   - KUDISMS_SENDER_ID   (Variable — falls back to the hardcoded
+ *                          "FISS ITOBE" approved Sender ID below)
+ * Sends via GET https://my.kudisms.net/api/sms with gateway=2 ("Refunds
+ * Charge for DND Numbers" — DND-registered recipients still won't
+ * actually receive the text, but you aren't billed for the attempt).
+ * A successful response looks like
+ * { status: "success", error_code: "000", data: ["234...|<msg-id>"], ... }.
  * Requires a `sms_log` table (see migration note at the bottom of this
  * section) — not created automatically, run it once via wrangler/D1 console.
  *
@@ -3781,31 +3777,28 @@ function normalizeNigerianPhone(raw) {
   return p;
 }
 
-async function sendTermiiSms(env, toRaw, message) {
-  const apiKey = env.TERMII_API_KEY;
-  if (!apiKey) return { ok: false, detail: "TERMII_API_KEY is not configured on the Worker." };
+async function sendKudiSms(env, toRaw, message) {
+  const apiKey = env.KUDISMS_API_KEY;
+  if (!apiKey) return { ok: false, detail: "KUDISMS_API_KEY is not configured on the Worker." };
 
   const to = normalizeNigerianPhone(toRaw);
   if (!to || to.length < 11) return { ok: false, detail: "Invalid phone number: " + toRaw };
 
   try {
-    const res = await fetch("https://v4.api.termii.com/api/sms/send", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        to,
-        from: env.TERMII_SENDER_ID || "N-Alert",
-        sms: message,
-        type: "plain",
-        channel: "generic",
-        api_key: apiKey
-      })
+    const params = new URLSearchParams({
+      token: apiKey,
+      senderID: env.KUDISMS_SENDER_ID || "FISS ITOBE",
+      recipients: to,
+      message,
+      gateway: "2" // refunds charge for DND numbers (they still won't receive the SMS)
     });
+    const res = await fetch(`https://my.kudisms.net/api/sms?${params.toString()}`, { method: "GET" });
     const data = await res.json().catch(() => ({}));
-    if (!res.ok || !data || data.code !== "ok") {
-      return { ok: false, detail: (data && (data.message || JSON.stringify(data))) || `HTTP ${res.status}` };
+    if (!res.ok || !data || data.status !== "success" || data.error_code !== "000") {
+      return { ok: false, detail: (data && (data.msg || JSON.stringify(data))) || `HTTP ${res.status}` };
     }
-    return { ok: true, detail: data.message_id };
+    const messageId = Array.isArray(data.data) ? data.data[0] : undefined;
+    return { ok: true, detail: messageId };
   } catch (err) {
     return { ok: false, detail: String((err && err.message) || err) };
   }
@@ -3921,7 +3914,7 @@ async function handleSmsRoutes(request, env, url) {
 
       const message = `${term} (${session}) result for ${stu.name} (${cls.name}) is out.${summary} View full result on the school portal.`;
 
-      const result = await sendTermiiSms(env, stu.guardian_phone, message);
+      const result = await sendKudiSms(env, stu.guardian_phone, message);
       await logSms(env, {
         category: "results", phone: stu.guardian_phone, label: stu.name, message,
         status: result.ok ? "sent" : "failed", detail: result.detail,
@@ -3955,7 +3948,7 @@ async function handleSmsRoutes(request, env, url) {
     const failed = [];
 
     for (const phone of uniquePhones) {
-      const result = await sendTermiiSms(env, phone, message);
+      const result = await sendKudiSms(env, phone, message);
       await logSms(env, {
         category: "broadcast", phone, label: label || null, message,
         status: result.ok ? "sent" : "failed", detail: result.detail,
@@ -4015,7 +4008,7 @@ async function handleSmsRoutes(request, env, url) {
  *   recipient_label TEXT,               -- student/contact name, if known
  *   message TEXT NOT NULL,
  *   status TEXT NOT NULL,               -- 'sent' | 'failed'
- *   provider_detail TEXT,               -- Termii message_id, or error text
+ *   provider_detail TEXT,               -- KudiSMS message id, or error text
  *   student_id TEXT,
  *   class_id TEXT,
  *   term TEXT,
