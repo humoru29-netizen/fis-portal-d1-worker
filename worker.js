@@ -1605,7 +1605,7 @@ async function handleRosterRoutes(request, env, url) {
       return json({ error: "Not authorised for this student." }, 403);
     }
 
-    const { name, classId, sessionJoined, guardianName, guardianPhone } = await request.json();
+    const { name, classId, sessionJoined, guardianName, guardianPhone, dob } = await request.json();
     if (!name || !classId) {
       return json({ error: "name and classId are required." }, 400);
     }
@@ -1623,10 +1623,10 @@ async function handleRosterRoutes(request, env, url) {
 
     await env.DB
       .prepare(
-        `UPDATE students SET name = ?, class_id = ?, level = ?, session_joined = ?, guardian_name = ?, guardian_phone = ?
+        `UPDATE students SET name = ?, class_id = ?, level = ?, session_joined = ?, guardian_name = ?, guardian_phone = ?, dob = ?
          WHERE id = ?`
       )
-      .bind(name, classId, newLevel, sessionJoined || null, guardianName || null, guardianPhone || null, studentId)
+      .bind(name, classId, newLevel, sessionJoined || null, guardianName || null, guardianPhone || null, dob || null, studentId)
       .run();
 
     return json({ message: "Student updated." });
@@ -2437,7 +2437,7 @@ async function handleReportCardRoutes(request, env, url) {
 
     const student = await env.DB
       .prepare(
-        `SELECT s.id, s.name, s.admission_no, s.class_id, s.photo_key, c.name AS class_name, c.level
+        `SELECT s.id, s.name, s.admission_no, s.class_id, s.photo_key, s.dob, c.name AS class_name, c.level
          FROM students s JOIN classes c ON c.id = s.class_id
          WHERE s.id = ?`
       )
@@ -2541,6 +2541,7 @@ async function handleReportCardRoutes(request, env, url) {
         admissionNo: student.admission_no,
         className: student.class_name,
         level: student.level,
+        dob: student.dob || null,
         photoUrl: student.photo_key || null
       },
       term,
@@ -4180,6 +4181,12 @@ async function handleSmsRoutes(request, env, url) {
  * teachers can be texted via /api/sms/notify-teachers):
  *
  * ALTER TABLE users ADD COLUMN phone TEXT;
+ *
+ * One-time D1 migration to add a date-of-birth column to students
+ * (needed so it can be shown on the printed report card — set per
+ * student via the Roster tool's Edit form, PATCH /api/students/:id):
+ *
+ * ALTER TABLE students ADD COLUMN dob TEXT;
  */
 
 // =====================================================================
