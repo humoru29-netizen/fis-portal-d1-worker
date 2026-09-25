@@ -3916,7 +3916,7 @@ async function handleSmsRoutes(request, env, url) {
     const failed = [];
     const skipped = [];
 
-    for (const stu of students) {
+    await Promise.all(students.map(async (stu) => {
       const approvedRow = await env.DB
         .prepare(
           `SELECT COUNT(*) AS count FROM results
@@ -3927,11 +3927,11 @@ async function handleSmsRoutes(request, env, url) {
 
       if (!approvedRow || approvedRow.count === 0) {
         skipped.push({ studentId: stu.id, name: stu.name, reason: "No released result for this term/session." });
-        continue;
+        return;
       }
       if (!stu.guardian_phone) {
         skipped.push({ studentId: stu.id, name: stu.name, reason: "No guardian phone number on file." });
-        continue;
+        return;
       }
 
       const avg = avgById[stu.id];
@@ -3951,7 +3951,7 @@ async function handleSmsRoutes(request, env, url) {
 
       if (result.ok) sent.push({ studentId: stu.id, name: stu.name });
       else failed.push({ studentId: stu.id, name: stu.name, reason: result.detail });
-    }
+    }));
 
     return json({
       message: `Sent ${sent.length}, failed ${failed.length}, skipped ${skipped.length}.`,
@@ -4002,7 +4002,7 @@ async function handleSmsRoutes(request, env, url) {
     const failed = [];
     const skipped = [];
 
-    for (const stu of students) {
+    await Promise.all(students.map(async (stu) => {
       const paidRow = await env.DB
         .prepare("SELECT COALESCE(SUM(amount), 0) AS total FROM fee_transactions WHERE student_id = ? AND term = ? AND session = ?")
         .bind(stu.id, term, session)
@@ -4011,11 +4011,11 @@ async function handleSmsRoutes(request, env, url) {
 
       if (balance <= 0) {
         skipped.push({ studentId: stu.id, name: stu.name, reason: "No outstanding balance." });
-        continue;
+        return;
       }
       if (!stu.guardian_phone) {
         skipped.push({ studentId: stu.id, name: stu.name, reason: "No guardian phone number on file." });
-        continue;
+        return;
       }
 
       const message = `Fee reminder: ${stu.name} (${cls.name}) has an outstanding balance of NGN ${balance.toLocaleString()} for ${term} (${session}). Kindly clear at your earliest convenience. - Faith International Schools, Itobe`;
@@ -4029,7 +4029,7 @@ async function handleSmsRoutes(request, env, url) {
 
       if (result.ok) sent.push({ studentId: stu.id, name: stu.name, balance });
       else failed.push({ studentId: stu.id, name: stu.name, reason: result.detail });
-    }
+    }));
 
     return json({
       message: `Sent ${sent.length}, failed ${failed.length}, skipped ${skipped.length}.`,
@@ -4068,10 +4068,10 @@ async function handleSmsRoutes(request, env, url) {
     const failed = [];
     const skipped = [];
 
-    for (const t of teachers) {
+    await Promise.all(teachers.map(async (t) => {
       if (!t.phone) {
         skipped.push({ staffId: t.id, name: t.name, reason: "No phone number on file." });
-        continue;
+        return;
       }
 
       const result = await sendKudiSms(env, t.phone, message);
@@ -4083,7 +4083,7 @@ async function handleSmsRoutes(request, env, url) {
 
       if (result.ok) sent.push({ staffId: t.id, name: t.name });
       else failed.push({ staffId: t.id, name: t.name, reason: result.detail });
-    }
+    }));
 
     return json({
       message: `Sent ${sent.length}, failed ${failed.length}, skipped ${skipped.length}.`,
@@ -4107,7 +4107,7 @@ async function handleSmsRoutes(request, env, url) {
     const sent = [];
     const failed = [];
 
-    for (const phone of uniquePhones) {
+    await Promise.all(uniquePhones.map(async (phone) => {
       const result = await sendKudiSms(env, phone, message);
       await logSms(env, {
         category: "broadcast", phone, label: label || null, message,
@@ -4116,7 +4116,7 @@ async function handleSmsRoutes(request, env, url) {
       });
       if (result.ok) sent.push(phone);
       else failed.push({ phone, reason: result.detail });
-    }
+    }));
 
     return json({
       message: `Sent ${sent.length}, failed ${failed.length}.`,
