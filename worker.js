@@ -3390,6 +3390,307 @@ async function handleSiteContentRoutes(request, env, url) {
   return null; // not handled here — let the router try the next module
 }
 
+// =====================================================================
+// SECTION 7B3: Gallery routes (public video/photo/text tiles)
+// =====================================================================
+/**
+ * FIS Itobe Portal — Worker API (School Gallery)
+ *
+ * One-time D1 migration (run via wrangler or the D1 console):
+ *
+ * CREATE TABLE gallery (
+ *   id TEXT PRIMARY KEY,
+ *   item_type TEXT NOT NULL DEFAULT 'video',  -- 'video' | 'photo' | 'text'
+ *   title TEXT,
+ *   caption TEXT,
+ *   video_url TEXT,
+ *   photo_url TEXT,
+ *   text_body TEXT,
+ *   sort_order INTEGER NOT NULL DEFAULT 0,
+ *   created_at TEXT NOT NULL
+ * );
+ *
+ * Routes:
+ *   GET    /api/public/gallery   (public) every item, tile-ordered
+ *   GET    /api/gallery          (auth: general_admin) same list, for management
+ *   POST   /api/gallery          (auth: general_admin)
+ *          { itemType: 'video'|'photo'|'text', title?, caption?, videoUrl?, photoUrl?, textBody?, sortOrder? }
+ *   DELETE /api/gallery/:id      (auth: general_admin)
+ */
+function galleryRowToJson(row) {
+  return {
+    id: row.id,
+    itemType: row.item_type,
+    title: row.title,
+    caption: row.caption,
+    video_url: row.video_url,
+    photo_url: row.photo_url,
+    text_body: row.text_body,
+    sort_order: row.sort_order,
+    created_at: row.created_at
+  };
+}
+
+async function handleGalleryRoutes(request, env, url) {
+  const { pathname } = url;
+
+  // ---------------- PUBLIC: GALLERY LIST ----------------
+  if (pathname === "/api/public/gallery" && request.method === "GET") {
+    try {
+      const { results } = await env.DB
+        .prepare("SELECT * FROM gallery ORDER BY sort_order ASC, created_at DESC")
+        .all();
+      return json({ items: results.map(galleryRowToJson) });
+    } catch (err) {
+      return json({ error: "gallery table not found — run the migration first.", detail: String((err && err.message) || err) }, 500);
+    }
+  }
+
+  // ---------------- ADMIN: GALLERY LIST (management) ----------------
+  if (pathname === "/api/gallery" && request.method === "GET") {
+    const sessionCtx = await getSession(request, env);
+    if (!isGeneralAdmin(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    try {
+      const { results } = await env.DB
+        .prepare("SELECT * FROM gallery ORDER BY sort_order ASC, created_at DESC")
+        .all();
+      return json({ items: results.map(galleryRowToJson) });
+    } catch (err) {
+      return json({ error: "gallery table not found — run the migration first.", detail: String((err && err.message) || err) }, 500);
+    }
+  }
+
+  // ---------------- ADMIN: ADD GALLERY ITEM ----------------
+  if (pathname === "/api/gallery" && request.method === "POST") {
+    const sessionCtx = await getSession(request, env);
+    if (!isGeneralAdmin(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const { itemType, title, caption, videoUrl, photoUrl, textBody, sortOrder } = await request.json();
+    const type = ["video", "photo", "text"].includes(itemType) ? itemType : "video";
+
+    if (type === "video" && !videoUrl) return json({ error: "videoUrl is required for a video item." }, 400);
+    if (type === "photo" && !photoUrl) return json({ error: "photoUrl is required for a photo item." }, 400);
+    if (type === "text" && (!textBody || !textBody.trim())) return json({ error: "textBody is required for a text item." }, 400);
+
+    const id = uuid();
+    await env.DB
+      .prepare(
+        `INSERT INTO gallery (id, item_type, title, caption, video_url, photo_url, text_body, sort_order, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))`
+      )
+      .bind(
+        id, type, title || null, caption || null,
+        type === "video" ? videoUrl : null,
+        type === "photo" ? photoUrl : null,
+        type === "text" ? textBody.trim() : null,
+        Number.isFinite(sortOrder) ? sortOrder : 0
+      )
+      .run();
+
+    return json({ message: "Gallery item saved.", id });
+  }
+
+  // ---------------- ADMIN: DELETE GALLERY ITEM ----------------
+  const galDeleteMatch = pathname.match(/^\/api\/gallery\/([^/]+)$/);
+  if (galDeleteMatch && request.method === "DELETE") {
+    const sessionCtx = await getSession(request, env);
+    if (!isGeneralAdmin(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    await env.DB.prepare("DELETE FROM gallery WHERE id = ?").bind(galDeleteMatch[1]).run();
+    return json({ message: "Gallery item removed." });
+  }
+
+  return null; // not handled here — let the router try the next module
+}
+
+// =====================================================================
+// SECTION 7B4: Birthday routes (auto-detected list + SMS + public wishes)
+// =====================================================================
+/**
+ * FIS Itobe Portal — Worker API (Birthdays)
+ *
+ * Two independent pieces:
+ *  - Auto-detected list, from students.dob / users.dob (month-day match
+ *    against today, year ignored) — used by the admin panel to see who
+ *    is celebrating today and to send the birthday SMS.
+ *  - Admin-authored public "wishes" (a photo + a message posted for a
+ *    specific person on the day of), shown on the public landing page.
+ *    These are independent of the auto-detected list on purpose — an
+ *    admin picks who to post for and writes the message each time.
+ *
+ * One-time D1 migrations:
+ *
+ * ALTER TABLE users ADD COLUMN dob TEXT;   -- staff date of birth, optional
+ *
+ * CREATE TABLE birthday_wishes (
+ *   id TEXT PRIMARY KEY,
+ *   person_type TEXT NOT NULL,   -- 'student' | 'staff'
+ *   person_id TEXT,
+ *   name TEXT NOT NULL,
+ *   photo_url TEXT,
+ *   message TEXT NOT NULL,
+ *   wish_date TEXT NOT NULL,     -- YYYY-MM-DD, set server-side to today
+ *   created_at TEXT NOT NULL
+ * );
+ *
+ * Routes:
+ *   GET  /api/birthdays/today       (auth: general_admin) auto-detected list for today
+ *   POST /api/sms/notify-birthdays  (auth: general_admin) { message } — texts today's list
+ *   GET  /api/public/birthdays      (public) today's posted wish cards
+ *   GET  /api/birthday-wishes       (auth: general_admin) today's posted wishes, for management
+ *   POST /api/birthday-wishes       (auth: general_admin) { personType, personId?, name, photoUrl?, message }
+ *   DELETE /api/birthday-wishes/:id (auth: general_admin)
+ */
+async function todaysBirthdayPeople(env) {
+  const { results: students } = await env.DB
+    .prepare(
+      `SELECT s.id, s.name, s.guardian_phone AS phone, c.name AS class_name
+       FROM students s LEFT JOIN classes c ON c.id = s.class_id
+       WHERE s.status = 'active' AND s.dob IS NOT NULL
+         AND strftime('%m-%d', s.dob) = strftime('%m-%d', 'now')
+       ORDER BY s.name`
+    )
+    .all();
+
+  const { results: staff } = await env.DB
+    .prepare(
+      `SELECT id, name, phone, role
+       FROM users
+       WHERE status = 'active' AND dob IS NOT NULL
+         AND strftime('%m-%d', dob) = strftime('%m-%d', 'now')
+       ORDER BY name`
+    )
+    .all();
+
+  return [
+    ...students.map(s => ({ id: s.id, type: "student", name: s.name, class_name: s.class_name, phone: s.phone })),
+    ...staff.map(t => ({ id: t.id, type: "staff", name: t.name, role: t.role, phone: t.phone }))
+  ];
+}
+
+async function handleBirthdayRoutes(request, env, url) {
+  const { pathname } = url;
+
+  // ---------------- ADMIN: TODAY'S AUTO-DETECTED LIST ----------------
+  if (pathname === "/api/birthdays/today" && request.method === "GET") {
+    const sessionCtx = await getSession(request, env);
+    if (!isGeneralAdmin(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    try {
+      const birthdays = await todaysBirthdayPeople(env);
+      return json({ birthdays });
+    } catch (err) {
+      return json({ error: "Could not check birthdays. Has the users.dob column been added?", detail: String((err && err.message) || err) }, 500);
+    }
+  }
+
+  // ---------------- ADMIN: SEND BIRTHDAY SMS FOR TODAY ----------------
+  if (pathname === "/api/sms/notify-birthdays" && request.method === "POST") {
+    const sessionCtx = await getSession(request, env);
+    if (!isGeneralAdmin(sessionCtx)) return json({ error: "Not authorised. SMS is restricted to the General Admin." }, 403);
+
+    const { message } = await request.json();
+    if (!message || !message.trim()) return json({ error: "message is required." }, 400);
+
+    const people = await todaysBirthdayPeople(env);
+    if (!people.length) return json({ error: "No one is celebrating a birthday today." }, 404);
+
+    const sent = [];
+    const failed = [];
+    const skipped = [];
+
+    await Promise.all(people.map(async (p) => {
+      if (!p.phone) {
+        skipped.push({ name: p.name, reason: "No phone number on file." });
+        return;
+      }
+      const result = await sendKudiSms(env, p.phone, message);
+      await logSms(env, {
+        category: "birthdays", phone: p.phone, label: p.name, message,
+        status: result.ok ? "sent" : "failed", detail: result.detail,
+        studentId: p.type === "student" ? p.id : null, sentBy: sessionCtx.id
+      });
+      if (result.ok) sent.push({ name: p.name });
+      else failed.push({ name: p.name, reason: result.detail });
+    }));
+
+    return json({
+      message: `Sent ${sent.length}, failed ${failed.length}, skipped ${skipped.length}.`,
+      sent, failed, skipped
+    });
+  }
+
+  // ---------------- PUBLIC: TODAY'S POSTED WISH CARDS ----------------
+  if (pathname === "/api/public/birthdays" && request.method === "GET") {
+    try {
+      const { results } = await env.DB
+        .prepare(
+          `SELECT id, name, photo_url, message FROM birthday_wishes
+           WHERE wish_date = date('now') ORDER BY created_at ASC`
+        )
+        .all();
+      return json({ wishes: results });
+    } catch (err) {
+      return json({ error: "birthday_wishes table not found — run the migration first.", detail: String((err && err.message) || err) }, 500);
+    }
+  }
+
+  // ---------------- ADMIN: TODAY'S POSTED WISHES (management) ----------------
+  if (pathname === "/api/birthday-wishes" && request.method === "GET") {
+    const sessionCtx = await getSession(request, env);
+    if (!isGeneralAdmin(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    try {
+      const { results } = await env.DB
+        .prepare(
+          `SELECT * FROM birthday_wishes WHERE wish_date = date('now') ORDER BY created_at ASC`
+        )
+        .all();
+      return json({ wishes: results });
+    } catch (err) {
+      return json({ error: "birthday_wishes table not found — run the migration first.", detail: String((err && err.message) || err) }, 500);
+    }
+  }
+
+  // ---------------- ADMIN: POST A WISH ----------------
+  if (pathname === "/api/birthday-wishes" && request.method === "POST") {
+    const sessionCtx = await getSession(request, env);
+    if (!isGeneralAdmin(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const { personType, personId, name, photoUrl, message } = await request.json();
+    if (!name || !message || !message.trim()) {
+      return json({ error: "name and message are required." }, 400);
+    }
+    if (personType && !["student", "staff"].includes(personType)) {
+      return json({ error: "personType must be 'student' or 'staff'." }, 400);
+    }
+
+    const id = uuid();
+    await env.DB
+      .prepare(
+        `INSERT INTO birthday_wishes (id, person_type, person_id, name, photo_url, message, wish_date, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, date('now'), datetime('now'))`
+      )
+      .bind(id, personType || null, personId || null, name, photoUrl || null, message.trim())
+      .run();
+
+    return json({ message: "Birthday wish posted to the public page.", id });
+  }
+
+  // ---------------- ADMIN: DELETE A WISH ----------------
+  const wishDeleteMatch = pathname.match(/^\/api\/birthday-wishes\/([^/]+)$/);
+  if (wishDeleteMatch && request.method === "DELETE") {
+    const sessionCtx = await getSession(request, env);
+    if (!isGeneralAdmin(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    await env.DB.prepare("DELETE FROM birthday_wishes WHERE id = ?").bind(wishDeleteMatch[1]).run();
+    return json({ message: "Wish removed." });
+  }
+
+  return null; // not handled here — let the router try the next module
+}
+
 
 // =====================================================================
 /**
@@ -4205,6 +4506,9 @@ async function handleSmsRoutes(request, env, url) {
  * student via the Roster tool's Edit form, PATCH /api/students/:id):
  *
  * ALTER TABLE students ADD COLUMN dob TEXT;
+ *
+ * (Gallery and birthday migrations are documented above their own route
+ * handlers — see handleGalleryRoutes and handleBirthdayRoutes.)
  */
 
 // =====================================================================
@@ -4226,6 +4530,8 @@ const modules = [
   handleAnnouncementRoutes,
   handleResultsRoutes,
   handleSiteContentRoutes,
+  handleGalleryRoutes,
+  handleBirthdayRoutes,
   handleSmsRoutes
 ];
 
