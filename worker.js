@@ -1192,6 +1192,11 @@ async function handleAssignmentRoutes(request, env, url) {
  *   DELETE /api/classes/:classId/subjects/:subjectId  (auth: admin) unassign a subject
  *   GET  /api/classes/:classId/pin-status?term=&session=  (auth: admin) per-student
  *        has-a-pin flag for that term/session, used to skip or flag already-assigned PINs
+ *   PATCH  /api/classes/:id           (auth: admin) set which class this one promotes into
+ *        body: { nextClassId }        (null/omit to clear)
+ *   POST /api/classes/:id/promote     (auth: admin) bulk-move selected active students out of
+ *        this class — into another class, or (if toClassId omitted) mark them status='graduated'
+ *        body: { studentIds: [...], toClassId? }
  *   DELETE /api/classes/:id           (auth: admin) delete a class (must have no active students)
  *   DELETE /api/subjects/:id          (auth: admin) delete a subject
  *   DELETE /api/students/:id          (auth: admin) soft-delete a student (sets status to inactive,
@@ -1583,6 +1588,105 @@ async function handleRosterRoutes(request, env, url) {
     await env.DB.prepare("DELETE FROM classes WHERE id = ?").bind(classId).run();
 
     return json({ message: "Class deleted." });
+  }
+
+  // ---------------- SET NEXT CLASS (used by Promotion) ----------------
+  if (classDetailMatch && request.method === "PATCH") {
+    const sessionCtx = await getSession(request, env);
+    if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const classId = classDetailMatch[1];
+    const cls = await env.DB.prepare("SELECT id, level FROM classes WHERE id = ?").bind(classId).first();
+    if (!cls) return json({ error: "Class not found." }, 404);
+
+    const restriction = adminLevelRestriction(sessionCtx);
+    if (restriction && cls.level !== restriction) {
+      return json({ error: "Not authorised for this class." }, 403);
+    }
+
+    const { nextClassId } = await request.json();
+    let normalizedNextClassId = null;
+    if (nextClassId) {
+      if (nextClassId === classId) {
+        return json({ error: "A class can't promote into itself." }, 400);
+      }
+      const target = await env.DB.prepare("SELECT id FROM classes WHERE id = ?").bind(nextClassId).first();
+      if (!target) return json({ error: "Target class not found." }, 404);
+      normalizedNextClassId = nextClassId;
+    }
+
+    await env.DB.prepare("UPDATE classes SET next_class_id = ? WHERE id = ?").bind(normalizedNextClassId, classId).run();
+    return json({ message: "Saved." });
+  }
+
+  // ---------------- PROMOTE STUDENTS ----------------
+  const promoteMatch = pathname.match(/^\/api\/classes\/([^/]+)\/promote$/);
+  if (promoteMatch && request.method === "POST") {
+    const sessionCtx = await getSession(request, env);
+    if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const fromClassId = promoteMatch[1];
+    const fromClass = await env.DB.prepare("SELECT id, level, name FROM classes WHERE id = ?").bind(fromClassId).first();
+    if (!fromClass) return json({ error: "Class not found." }, 404);
+
+    const restriction = adminLevelRestriction(sessionCtx);
+    if (restriction && fromClass.level !== restriction) {
+      return json({ error: "Not authorised for this class." }, 403);
+    }
+
+    const { studentIds, toClassId } = await request.json();
+    if (!Array.isArray(studentIds) || !studentIds.length) {
+      return json({ error: "Select at least one student to promote." }, 400);
+    }
+
+    let toClass = null;
+    if (toClassId) {
+      toClass = await env.DB.prepare("SELECT id, level, name FROM classes WHERE id = ?").bind(toClassId).first();
+      if (!toClass) return json({ error: "Destination class not found." }, 404);
+      if (toClass.id === fromClass.id) {
+        return json({ error: "Destination class must be different from the current class." }, 400);
+      }
+      if (restriction && toClass.level !== restriction) {
+        return json({ error: `As a ${restriction} admin, you can only promote into ${restriction} classes.` }, 403);
+      }
+    }
+
+    // Only touch students who are actually still active in the stated class —
+    // guards against a stale checklist promoting/graduating the wrong students.
+    const placeholders = studentIds.map(() => "?").join(",");
+    const { results: eligible } = await env.DB
+      .prepare(`SELECT id FROM students WHERE class_id = ? AND status = 'active' AND id IN (${placeholders})`)
+      .bind(fromClassId, ...studentIds)
+      .all();
+
+    if (!eligible.length) {
+      return json({ error: "None of the selected students are currently active in this class." }, 409);
+    }
+
+    const eligibleIds = eligible.map(s => s.id);
+    const idPlaceholders = eligibleIds.map(() => "?").join(",");
+
+    if (toClass) {
+      await env.DB
+        .prepare(`UPDATE students SET class_id = ?, level = ? WHERE id IN (${idPlaceholders})`)
+        .bind(toClass.id, toClass.level, ...eligibleIds)
+        .run();
+      return json({
+        message: `${eligibleIds.length} student(s) promoted from ${fromClass.name} to ${toClass.name}.`,
+        promoted: eligibleIds.length
+      });
+    }
+
+    // No destination class — this is the graduating class; students become alumni
+    // and drop off active rosters, same as the soft-delete status but distinguishable.
+    await env.DB
+      .prepare(`UPDATE students SET status = 'graduated' WHERE id IN (${idPlaceholders})`)
+      .bind(...eligibleIds)
+      .run();
+    return json({
+      message: `${eligibleIds.length} student(s) graduated from ${fromClass.name}.`,
+      graduated: eligibleIds.length
+    });
   }
 
   // ---------------- DELETE SUBJECT ----------------
@@ -4515,6 +4619,12 @@ async function handleSmsRoutes(request, env, url) {
  * student via the Roster tool's Edit form, PATCH /api/students/:id):
  *
  * ALTER TABLE students ADD COLUMN dob TEXT;
+ *
+ * One-time D1 migration to add a next-class link to classes (needed for
+ * the Promotion tool — set per class via PATCH /api/classes/:id, used to
+ * pre-fill the destination class when promoting a class's students):
+ *
+ * ALTER TABLE classes ADD COLUMN next_class_id TEXT;
  *
  * (Gallery and birthday migrations are documented above their own route
  * handlers — see handleGalleryRoutes and handleBirthdayRoutes.)
