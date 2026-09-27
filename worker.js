@@ -3162,6 +3162,7 @@ async function handleCbtRoutes(request, env, url) {
  *   POST   /api/announcements        (auth: general_admin) { title, body, audience }
  *   GET    /api/announcements        (auth: any logged-in) personalised feed
  *   GET    /api/announcements/all    (auth: admin) full unfiltered list, for management
+ *   GET    /api/public/announcements (public) recent audience='all' announcements, for the landing-page ticker
  *   DELETE /api/announcements/:id    (auth: general_admin)
  *
  * `audience` is one of: 'all', 'staff', 'teachers', 'students',
@@ -3225,6 +3226,14 @@ async function handleAnnouncementRoutes(request, env, url) {
 
     const feed = results.filter(a => announcementMatchesSession(a.audience, sessionCtx));
     return json({ announcements: feed });
+  }
+
+  // ---------------- PUBLIC: LANDING PAGE TICKER FEED ----------------
+  if (pathname === "/api/public/announcements" && request.method === "GET") {
+    const { results } = await env.DB
+      .prepare("SELECT id, title, body, created_at FROM announcements WHERE audience = 'all' ORDER BY created_at DESC LIMIT 20")
+      .all();
+    return json({ announcements: results });
   }
 
   // ---------------- FULL LIST (admin management) ----------------
