@@ -382,6 +382,24 @@ async function handleAuthRoutes(request, env, url) {
     });
   }
 
+  // ---------------- REFRESH TOKEN ----------------
+  // Called silently by the frontend while a session is still active, to
+  // extend it before it expires (staff: 12h, student: 6h) without forcing
+  // a fresh login. Requires a still-valid token — an already-expired token
+  // fails getSession() and gets 401 like any other protected route.
+  if (pathname === "/api/refresh" && request.method === "POST") {
+    const sessionCtx = await getSession(request, env);
+    if (!sessionCtx) return json({ error: "Not authenticated." }, 401);
+
+    const payload = sessionCtx.type === "staff"
+      ? { sub: sessionCtx.id, type: "staff", role: sessionCtx.role }
+      : { sub: sessionCtx.id, type: "student" };
+    const expiresInSeconds = sessionCtx.type === "student" ? 60 * 60 * 6 : DEFAULT_EXPIRY_SECONDS;
+
+    const token = await signToken(payload, env.JWT_SECRET, expiresInSeconds);
+    return json({ token });
+  }
+
   // ---------------- ME ----------------
   if (pathname === "/api/me" && request.method === "GET") {
     const sessionCtx = await getSession(request, env);
