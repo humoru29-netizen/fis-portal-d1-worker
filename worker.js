@@ -3477,7 +3477,7 @@ async function handleAnnouncementRoutes(request, env, url) {
       .bind(id, title, body, audience, sessionCtx.id)
       .run();
 
-    return json({ message: "Announcement posted.", id });
+    return json({ message: "Posted.", id });
   }
 
   // ---------------- PERSONALISED FEED ----------------
@@ -3539,7 +3539,7 @@ async function handleAnnouncementRoutes(request, env, url) {
     if (!isGeneralAdmin(sessionCtx)) return json({ error: "Not authorised." }, 403);
 
     await env.DB.prepare("DELETE FROM announcements WHERE id = ?").bind(deleteMatch[1]).run();
-    return json({ message: "Announcement deleted." });
+    return json({ message: "Deleted." });
   }
 
   return null; // not handled here — let the router try the next module
@@ -3554,6 +3554,8 @@ async function handleAnnouncementRoutes(request, env, url) {
  * Routes:
  *   GET   /api/public/about                    (public) current About Us text
  *   PUT   /api/settings/about                   (auth: general_admin) { value }
+ *   GET   /api/public/contact                   (public) current contact info (address, phones, email)
+ *   PUT   /api/settings/contact                  (auth: general_admin) { address, phones, email }
  *   GET   /api/public/leadership                (public) leadership list, ordered
  *   GET   /api/leadership                       (auth: general_admin) leadership list (admin management)
  *   POST  /api/leadership                       (auth: general_admin) { name, title, phone, bio, sortOrder }
@@ -3588,6 +3590,52 @@ async function handleSiteContentRoutes(request, env, url) {
       .run();
 
     return json({ message: "About Us updated." });
+  }
+
+  // ---------------- PUBLIC: CONTACT INFO ----------------
+  // Single source of truth for phones/email/address shown in the portal's
+  // own footer and — via this same public, unauthenticated endpoint — on
+  // any other site (e.g. the separate public landing page/builder) that
+  // wants to pull the school's contact details live instead of hardcoding
+  // them, so they only ever need to be updated in one place.
+  if (pathname === "/api/public/contact" && request.method === "GET") {
+    const row = await env.DB.prepare("SELECT value FROM portal_settings WHERE key = 'contact_info'").first();
+    const fallback = { address: null, phones: [], email: null };
+    if (!row) return json(fallback);
+    try {
+      return json(JSON.parse(row.value));
+    } catch {
+      return json(fallback);
+    }
+  }
+
+  // ---------------- ADMIN: SAVE CONTACT INFO ----------------
+  if (pathname === "/api/settings/contact" && request.method === "PUT") {
+    const sessionCtx = await getSession(request, env);
+    if (!isGeneralAdmin(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const body = await request.json();
+    const address = typeof body.address === "string" ? body.address.trim() : "";
+    const email = typeof body.email === "string" ? body.email.trim() : "";
+    const phones = Array.isArray(body.phones)
+      ? body.phones.map(p => String(p).trim()).filter(Boolean)
+      : String(body.phones || "").split(",").map(p => p.trim()).filter(Boolean);
+
+    if (!address && !email && !phones.length) {
+      return json({ error: "Provide at least an address, phone number, or email." }, 400);
+    }
+
+    const value = JSON.stringify({ address, phones, email });
+
+    await env.DB
+      .prepare(
+        `INSERT INTO portal_settings (key, value) VALUES ('contact_info', ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value`
+      )
+      .bind(value)
+      .run();
+
+    return json({ message: "Contact info updated.", address, phones, email });
   }
 
   // ---------------- PUBLIC: LEADERSHIP LIST ----------------
