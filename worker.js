@@ -94,6 +94,52 @@ async function verify(password, storedHash) {
 }
 
 // =====================================================================
+// SECTION 1B: Reversible PIN encryption (AES-GCM via Web Crypto)
+// =====================================================================
+/**
+ * Student login PINs are stored one-way hashed (above) for verifying a
+ * login attempt, but that means a PIN can never be shown again once
+ * generated. To let an admin reprint an already-issued PIN without
+ * changing it, we also keep a reversible, encrypted copy, keyed from
+ * JWT_SECRET so no extra binding is needed.
+ * Stored format: "<ivBase64>.<ciphertextBase64>"
+ */
+async function getPinEncKey(env) {
+  const raw = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(env.JWT_SECRET + ":pin-enc")
+  );
+  return crypto.subtle.importKey("raw", raw, { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
+}
+
+async function encryptPin(pin, env) {
+  const key = await getPinEncKey(env);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ciphertext = await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv },
+    key,
+    new TextEncoder().encode(pin)
+  );
+  return `${toBase64(iv)}.${toBase64(ciphertext)}`;
+}
+
+async function decryptPin(encrypted, env) {
+  if (!encrypted) return null;
+  const [ivB64, ctB64] = encrypted.split(".");
+  if (!ivB64 || !ctB64) return null;
+  try {
+    const key = await getPinEncKey(env);
+    const iv = new Uint8Array(fromBase64(ivB64));
+    const plainBuf = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, fromBase64(ctB64));
+    return new TextDecoder().decode(plainBuf);
+  } catch {
+    // Covers PINs generated before this feature existed (no pin_enc yet)
+    // or any decrypt failure — caller treats a null return as unrecoverable.
+    return null;
+  }
+}
+
+// =====================================================================
 // SECTION 2: JWT (HMAC-signed session tokens via Web Crypto)
 // =====================================================================
 /**
@@ -1440,6 +1486,7 @@ async function handleRosterRoutes(request, env, url) {
 
     const pin = generatePin();
     const pinHash = await hash(pin);
+    const pinEnc = await encryptPin(pin, env);
 
     const existing = await env.DB
       .prepare("SELECT id FROM student_pins WHERE student_id = ? AND term = ? AND session = ?")
@@ -1449,22 +1496,75 @@ async function handleRosterRoutes(request, env, url) {
     if (existing) {
       await env.DB
         .prepare(
-          `UPDATE student_pins SET pin_hash = ?, generated_at = datetime('now'), failed_attempts = 0, locked_until = NULL
+          `UPDATE student_pins SET pin_hash = ?, pin_enc = ?, generated_at = datetime('now'), failed_attempts = 0, locked_until = NULL
            WHERE student_id = ? AND term = ? AND session = ?`
         )
-        .bind(pinHash, studentId, term, session)
+        .bind(pinHash, pinEnc, studentId, term, session)
         .run();
     } else {
       await env.DB
         .prepare(
-          `INSERT INTO student_pins (id, student_id, pin_hash, term, session, generated_at)
-           VALUES (?, ?, ?, ?, ?, datetime('now'))`
+          `INSERT INTO student_pins (id, student_id, pin_hash, pin_enc, term, session, generated_at)
+           VALUES (?, ?, ?, ?, ?, ?, datetime('now'))`
         )
-        .bind(uuid(), studentId, pinHash, term, session)
+        .bind(uuid(), studentId, pinHash, pinEnc, term, session)
         .run();
     }
 
+    // A PIN is only ever valid for the term/session it was issued for.
+    // The moment a student is issued a PIN for this term, retire every
+    // other term/session's PIN for that student — the row is gone, so a
+    // login attempt against an old term now gets "No PIN has been
+    // generated for this term/session yet." instead of succeeding.
+    await env.DB
+      .prepare("DELETE FROM student_pins WHERE student_id = ? AND NOT (term = ? AND session = ?)")
+      .bind(studentId, term, session)
+      .run();
+
     return json({ message: "PIN generated.", pin, term, session });
+  }
+
+  // ---------------- FETCH EXISTING STUDENT PIN (for reprinting) ----------------
+  // Same route as PIN generation above, but GET: returns the PIN already on
+  // file for this term/session (decrypted) without creating a new one, so
+  // an admin can reprint a slip without changing the student's actual PIN.
+  if (pinMatch && request.method === "GET") {
+    const sessionCtx = await getSession(request, env);
+    if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const studentId = pinMatch[1];
+    const term = url.searchParams.get("term");
+    const session = url.searchParams.get("session");
+    if (!term || !session) {
+      return json({ error: "term and session are required." }, 400);
+    }
+
+    const student = await env.DB
+      .prepare("SELECT id, level FROM students WHERE id = ? AND status = 'active'")
+      .bind(studentId)
+      .first();
+    if (!student) return json({ error: "Student not found." }, 404);
+
+    const restriction = adminLevelRestriction(sessionCtx);
+    if (restriction && student.level !== restriction) {
+      return json({ error: "Not authorised for this student." }, 403);
+    }
+
+    const pinRow = await env.DB
+      .prepare("SELECT pin_enc FROM student_pins WHERE student_id = ? AND term = ? AND session = ?")
+      .bind(studentId, term, session)
+      .first();
+    if (!pinRow) return json({ error: "No PIN has been generated for this term/session yet." }, 404);
+
+    const pin = await decryptPin(pinRow.pin_enc, env);
+    if (!pin) {
+      return json(
+        { error: "This PIN predates reprinting support and can't be recovered — regenerate it." },
+        404
+      );
+    }
+
+    return json({ pin, term, session });
   }
 
   // ---------------- LIST SUBJECTS ----------------
@@ -1598,7 +1698,8 @@ async function handleRosterRoutes(request, env, url) {
     const { results } = await env.DB
       .prepare(
         `SELECT s.id, s.name, s.admission_no,
-                CASE WHEN sp.id IS NOT NULL THEN 1 ELSE 0 END AS has_pin
+                CASE WHEN sp.id IS NOT NULL THEN 1 ELSE 0 END AS has_pin,
+                sp.pin_enc AS pin_enc
          FROM students s
          LEFT JOIN student_pins sp
            ON sp.student_id = s.id AND sp.term = ? AND sp.session = ?
@@ -1608,7 +1709,19 @@ async function handleRosterRoutes(request, env, url) {
       .bind(term, session, classId)
       .all();
 
-    return json({ classId, term, session, students: results });
+    // Decrypt each existing PIN so an already-assigned student can still
+    // be shown/printed without needing a fresh PIN generated.
+    const students = await Promise.all(
+      results.map(async (r) => ({
+        id: r.id,
+        name: r.name,
+        admission_no: r.admission_no,
+        has_pin: r.has_pin,
+        pin: r.has_pin ? await decryptPin(r.pin_enc, env) : null
+      }))
+    );
+
+    return json({ classId, term, session, students });
   }
 
   // ---------------- DELETE CLASS ----------------
@@ -4682,6 +4795,13 @@ async function handleSmsRoutes(request, env, url) {
  *
  * ALTER TABLE student_pins ADD COLUMN failed_attempts INTEGER NOT NULL DEFAULT 0;
  * ALTER TABLE student_pins ADD COLUMN locked_until TEXT;
+ *
+ * One-time D1 migration to add reversible PIN storage to student_pins
+ * (needed so an already-generated PIN can be reprinted — see encryptPin /
+ * decryptPin and GET /api/students/:id/pin — without ever regenerating it
+ * or storing it in plain text):
+ *
+ * ALTER TABLE student_pins ADD COLUMN pin_enc TEXT;
  *
  * (Gallery and birthday migrations are documented above their own route
  * handlers — see handleGalleryRoutes and handleBirthdayRoutes.)
