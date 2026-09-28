@@ -2242,6 +2242,7 @@ async function handleAdmissionRoutes(request, env, url) {
  * Routes:
  *   GET    /api/staff                    (auth: admin) list all non-pending staff accounts
  *   PATCH  /api/staff/:id                (auth: admin) { role, level } change role/level
+ *   PATCH  /api/staff/:id/dob            (auth: admin) { dob: 'YYYY-MM-DD' } staff birthday for the birthday list
  *   PATCH  /api/staff/:id/status         (auth: admin) { status: 'active'|'suspended' }
  *   POST   /api/staff/:id/reset-password (auth: admin) generates + returns a new temporary password
  *   DELETE /api/staff/:id                (auth: admin) permanently remove the account
@@ -2270,7 +2271,7 @@ async function handleManageAccountsRoutes(request, env, url) {
 
     const { results } = await env.DB
       .prepare(
-        `SELECT id, name, email, phone, role, level, status, created_at, approved_by, approved_at
+        `SELECT id, name, email, phone, dob, role, level, status, created_at, approved_by, approved_at
          FROM users WHERE status IN ('active', 'suspended') ORDER BY name`
       )
       .all();
@@ -2317,6 +2318,25 @@ async function handleManageAccountsRoutes(request, env, url) {
     await env.DB.prepare("UPDATE users SET phone = ? WHERE id = ?").bind(phone ? String(phone).trim() : null, staffId).run();
 
     return json({ message: "Phone number saved." });
+  }
+
+  // ---------------- SET/UPDATE DATE OF BIRTH (drives the staff birthday list) ----------------
+  const dobMatch = pathname.match(/^\/api\/staff\/([^/]+)\/dob$/);
+  if (dobMatch && request.method === "PATCH") {
+    const sessionCtx = await getSession(request, env);
+    if (!isGeneralAdmin(sessionCtx)) return json({ error: "Not authorised. Only the General Admin can manage accounts." }, 403);
+
+    const staffId = dobMatch[1];
+    const { dob } = await request.json();
+    if (dob && !/^\d{4}-\d{2}-\d{2}$/.test(String(dob))) {
+      return json({ error: "Date of birth must be a valid date (YYYY-MM-DD)." }, 400);
+    }
+
+    const target = await env.DB.prepare("SELECT id FROM users WHERE id = ?").bind(staffId).first();
+    if (!target) return json({ error: "Account not found." }, 404);
+
+    await env.DB.prepare("UPDATE users SET dob = ? WHERE id = ?").bind(dob || null, staffId).run();
+    return json({ message: "Date of birth saved." });
   }
 
   // ---------------- SUSPEND / REACTIVATE ----------------
@@ -3856,7 +3876,18 @@ async function handleGalleryRoutes(request, env, url) {
  *   created_at TEXT NOT NULL
  * );
  *
+ * Automatic wishes (run once more if upgrading from the earlier version):
+ *
+ * ALTER TABLE birthday_wishes ADD COLUMN status TEXT NOT NULL DEFAULT 'approved';
+ * ALTER TABLE birthday_wishes ADD COLUMN source TEXT NOT NULL DEFAULT 'manual';
+ * CREATE UNIQUE INDEX idx_bw_person_day ON birthday_wishes(person_type, person_id, wish_date) WHERE person_id IS NOT NULL;
+ *
+ * Staff birthdays are turned into a wish automatically and published at once.
+ * Student birthdays are turned into a "pending" wish for the General Admin to
+ * approve (or edit / skip) before it shows on the homepage.
+ *
  * Routes:
+ *   PATCH /api/birthday-wishes/:id  (auth: general_admin) { status?, message? } approve / skip / edit
  *   GET  /api/birthdays/today       (auth: general_admin) auto-detected list for today
  *   POST /api/sms/notify-birthdays  (auth: general_admin) { message } — texts today's list
  *   GET  /api/public/birthdays      (public) today's posted wish cards
@@ -3867,10 +3898,10 @@ async function handleGalleryRoutes(request, env, url) {
 async function todaysBirthdayPeople(env) {
   const { results: students } = await env.DB
     .prepare(
-      `SELECT s.id, s.name, s.guardian_phone AS phone, c.name AS class_name
+      `SELECT s.id, s.name, s.guardian_phone AS phone, s.photo_key AS photo, c.name AS class_name
        FROM students s LEFT JOIN classes c ON c.id = s.class_id
        WHERE s.status = 'active' AND s.dob IS NOT NULL
-         AND strftime('%m-%d', s.dob) = strftime('%m-%d', 'now')
+         AND strftime('%m-%d', s.dob) = strftime('%m-%d', 'now', '+1 hour')
        ORDER BY s.name`
     )
     .all();
@@ -3880,15 +3911,57 @@ async function todaysBirthdayPeople(env) {
       `SELECT id, name, phone, role
        FROM users
        WHERE status = 'active' AND dob IS NOT NULL
-         AND strftime('%m-%d', dob) = strftime('%m-%d', 'now')
+         AND strftime('%m-%d', dob) = strftime('%m-%d', 'now', '+1 hour')
        ORDER BY name`
     )
     .all();
 
   return [
-    ...students.map(s => ({ id: s.id, type: "student", name: s.name, class_name: s.class_name, phone: s.phone })),
+    ...students.map(s => ({ id: s.id, type: "student", name: s.name, class_name: s.class_name, phone: s.phone, photo: s.photo })),
     ...staff.map(t => ({ id: t.id, type: "staff", name: t.name, role: t.role, phone: t.phone }))
   ];
+}
+
+
+// ---- Automatic birthday wishes -------------------------------------------
+// Staff wishes are published straight away. Student wishes are created as
+// "pending" so the General Admin can review/edit and approve them before
+// they appear on the public homepage. Runs lazily (whenever the homepage or
+// the admin panel asks) and is idempotent — one wish per person per day.
+const STAFF_WISH_TEMPLATES = [
+  "Happy Birthday! Thank you for your dedication and care. The whole FIS Itobe family celebrates you today. May God bless you abundantly.",
+  "Wishing you a joyful birthday and a year full of good health, peace and success. We are grateful to have you on our team.",
+  "Today we celebrate you! Thank you for shaping young lives with love and commitment. Happy Birthday from all of us at FIS Itobe.",
+  "Happy Birthday! May the Lord grant you many more years, strength for every task and joy in all you do."
+];
+const STUDENT_WISH_TEMPLATES = [
+  "Happy Birthday! Everyone at Faith International School Itobe is celebrating you today. May God bless you and make this year your best yet.",
+  "Wishing you a wonderful birthday full of joy and laughter. Keep learning, keep shining. In God We Trust!",
+  "Today is your special day! May God guide you, grant you wisdom and fill your year with success. Happy Birthday from your FIS Itobe family.",
+  "Happy Birthday! We are proud of you. May this new year bring you good health, great grades and lots of happiness."
+];
+
+function pickTemplate(list, seed) {
+  let h = 0;
+  const str = String(seed);
+  for (let i = 0; i < str.length; i++) h = (h * 31 + str.charCodeAt(i)) >>> 0;
+  return list[h % list.length];
+}
+
+async function syncTodaysBirthdayWishes(env) {
+  const people = await todaysBirthdayPeople(env);
+  for (const p of people) {
+    const isStaff = p.type === "staff";
+    const message = pickTemplate(isStaff ? STAFF_WISH_TEMPLATES : STUDENT_WISH_TEMPLATES, p.id);
+    await env.DB
+      .prepare(
+        `INSERT OR IGNORE INTO birthday_wishes
+           (id, person_type, person_id, name, photo_url, message, wish_date, status, source, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, date('now', '+1 hour'), ?, 'auto', datetime('now'))`
+      )
+      .bind(uuid(), p.type, p.id, p.name, isStaff ? null : (p.photo || null), message, isStaff ? "approved" : "pending")
+      .run();
+  }
 }
 
 async function handleBirthdayRoutes(request, env, url) {
@@ -3946,10 +4019,11 @@ async function handleBirthdayRoutes(request, env, url) {
   // ---------------- PUBLIC: TODAY'S POSTED WISH CARDS ----------------
   if (pathname === "/api/public/birthdays" && request.method === "GET") {
     try {
+      await syncTodaysBirthdayWishes(env);
       const { results } = await env.DB
         .prepare(
           `SELECT id, name, photo_url, message FROM birthday_wishes
-           WHERE wish_date = date('now') ORDER BY created_at ASC`
+           WHERE wish_date = date('now', '+1 hour') AND status = 'approved' ORDER BY created_at ASC`
         )
         .all();
       return json({ wishes: results });
@@ -3964,12 +4038,13 @@ async function handleBirthdayRoutes(request, env, url) {
     if (!isGeneralAdmin(sessionCtx)) return json({ error: "Not authorised." }, 403);
 
     try {
+      await syncTodaysBirthdayWishes(env);
       const { results } = await env.DB
         .prepare(
-          `SELECT * FROM birthday_wishes WHERE wish_date = date('now') ORDER BY created_at ASC`
+          `SELECT * FROM birthday_wishes WHERE wish_date = date('now', '+1 hour') AND status != 'rejected' ORDER BY (status = 'pending') DESC, created_at ASC`
         )
         .all();
-      return json({ wishes: results });
+      return json({ wishes: results, pendingCount: results.filter(w => w.status === "pending").length });
     } catch (err) {
       return json({ error: "birthday_wishes table not found — run the migration first.", detail: String((err && err.message) || err) }, 500);
     }
@@ -3992,12 +4067,37 @@ async function handleBirthdayRoutes(request, env, url) {
     await env.DB
       .prepare(
         `INSERT INTO birthday_wishes (id, person_type, person_id, name, photo_url, message, wish_date, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, date('now'), datetime('now'))`
+         VALUES (?, ?, ?, ?, ?, ?, date('now', '+1 hour'), datetime('now'))`
       )
       .bind(id, personType || null, personId || null, name, photoUrl || null, message.trim())
       .run();
 
     return json({ message: "Birthday wish posted to the public page.", id });
+  }
+
+  // ---------------- ADMIN: APPROVE / EDIT / REJECT A WISH ----------------
+  const wishPatchMatch = pathname.match(/^\/api\/birthday-wishes\/([^/]+)$/);
+  if (wishPatchMatch && request.method === "PATCH") {
+    const sessionCtx = await getSession(request, env);
+    if (!isGeneralAdmin(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const { status, message } = await request.json();
+    if (status && !["approved", "rejected", "pending"].includes(status)) {
+      return json({ error: "status must be approved, rejected or pending." }, 400);
+    }
+    if (message !== undefined && !String(message).trim()) {
+      return json({ error: "The message cannot be empty." }, 400);
+    }
+
+    const existing = await env.DB.prepare("SELECT id FROM birthday_wishes WHERE id = ?").bind(wishPatchMatch[1]).first();
+    if (!existing) return json({ error: "Wish not found." }, 404);
+
+    await env.DB
+      .prepare("UPDATE birthday_wishes SET status = COALESCE(?, status), message = COALESCE(?, message) WHERE id = ?")
+      .bind(status || null, message !== undefined ? String(message).trim() : null, wishPatchMatch[1])
+      .run();
+
+    return json({ message: status === "approved" ? "Approved and published on the homepage." : status === "rejected" ? "Skipped — it will not be shown." : "Saved." });
   }
 
   // ---------------- ADMIN: DELETE A WISH ----------------
@@ -4013,6 +4113,73 @@ async function handleBirthdayRoutes(request, env, url) {
   return null; // not handled here — let the router try the next module
 }
 
+
+// =====================================================================
+// SECTION 7B5: Audit trail (who changed what, and when)
+// =====================================================================
+/**
+ * Every successful change (POST / PATCH / DELETE) made by a logged-in
+ * staff member is recorded automatically by the router below — request
+ * bodies are never stored, so passwords and PINs can't leak into it.
+ *
+ * One-time D1 migration:
+ *
+ * CREATE TABLE audit_log (
+ *   id TEXT PRIMARY KEY,
+ *   actor_id TEXT,
+ *   actor_name TEXT,
+ *   actor_role TEXT,
+ *   method TEXT NOT NULL,
+ *   path TEXT NOT NULL,
+ *   status INTEGER,
+ *   created_at TEXT NOT NULL
+ * );
+ * CREATE INDEX idx_audit_created ON audit_log(created_at);
+ *
+ * Route:
+ *   GET /api/audit?limit=  (auth: general_admin) newest first, max 500
+ */
+const AUDIT_SKIP_PATHS = ["/api/login", "/api/student-login", "/api/refresh", "/api/signup", "/api/admissions/apply", "/api/audit"];
+
+async function recordAudit(request, env, url, response) {
+  try {
+    if (!["POST", "PATCH", "DELETE"].includes(request.method)) return;
+    if (response.status >= 400) return;
+    if (url.pathname.startsWith("/api/public/") || AUDIT_SKIP_PATHS.includes(url.pathname)) return;
+
+    const session = await getSession(request, env);
+    if (!session || session.type !== "staff") return;
+
+    await env.DB
+      .prepare(
+        `INSERT INTO audit_log (id, actor_id, actor_name, actor_role, method, path, status, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))`
+      )
+      .bind(uuid(), session.id, session.record.name || null, session.role || null, request.method, url.pathname, response.status)
+      .run();
+  } catch (err) {
+    // Auditing must never break the request it is recording.
+  }
+}
+
+async function handleAuditRoutes(request, env, url) {
+  if (url.pathname === "/api/audit" && request.method === "GET") {
+    const sessionCtx = await getSession(request, env);
+    if (!isGeneralAdmin(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const limit = Math.min(Math.max(parseInt(url.searchParams.get("limit"), 10) || 200, 1), 500);
+    try {
+      const { results } = await env.DB
+        .prepare("SELECT * FROM audit_log ORDER BY created_at DESC LIMIT ?")
+        .bind(limit)
+        .all();
+      return json({ entries: results });
+    } catch (err) {
+      return json({ error: "audit_log table not found — run the migration first.", detail: String((err && err.message) || err) }, 500);
+    }
+  }
+  return null;
+}
 
 // =====================================================================
 /**
@@ -4876,6 +5043,7 @@ const modules = [
   handleSiteContentRoutes,
   handleGalleryRoutes,
   handleBirthdayRoutes,
+  handleAuditRoutes,
   handleSmsRoutes
 ];
 
@@ -4899,6 +5067,7 @@ export default {
       for (const handler of modules) {
         const response = await handler(request, env, url);
         if (response) {
+          await recordAudit(request, env, url, response);
           const merged = new Headers(response.headers);
           for (const [k, v] of Object.entries(corsHeaders())) merged.set(k, v);
           return new Response(response.body, { status: response.status, headers: merged });
