@@ -3889,12 +3889,14 @@ async function handleGalleryRoutes(request, env, url) {
  * ALTER TABLE birthday_wishes ADD COLUMN source TEXT NOT NULL DEFAULT 'manual';
  * CREATE UNIQUE INDEX idx_bw_person_day ON birthday_wishes(person_type, person_id, wish_date) WHERE person_id IS NOT NULL;
  *
- * Staff birthdays are turned into a wish automatically and published at once.
- * Student birthdays are turned into a "pending" wish for the General Admin to
- * approve (or edit / skip) before it shows on the homepage.
+ * Staff AND student birthdays are turned into homepage wishes automatically.
+ * Staff are texted automatically. A student's guardian SMS waits for the
+ * General Admin (sms_status 'pending' -> 'sent' | 'declined' | 'failed').
+ * If upgrading from the approval-first version, run once:
+ *   UPDATE birthday_wishes SET status = 'approved', sms_status = 'pending' WHERE status = 'pending';
  *
  * Routes:
- *   PATCH /api/birthday-wishes/:id  (auth: general_admin) { status?, message? } approve / skip / edit
+ *   PATCH /api/birthday-wishes/:id  (auth: general_admin) { message?, smsAction?: 'send'|'skip', status?: 'rejected' }
  *   GET  /api/birthdays/today       (auth: general_admin) auto-detected list for today
  *   POST /api/sms/notify-birthdays  (auth: general_admin) { message } — texts today's list
  *   GET  /api/public/birthdays      (public) today's posted wish cards
@@ -3990,14 +3992,24 @@ async function syncTodaysBirthdayWishes(env) {
       .prepare(
         `INSERT OR IGNORE INTO birthday_wishes
            (id, person_type, person_id, name, photo_url, message, wish_date, status, source, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, date('now', '+1 hour'), ?, 'auto', datetime('now'))`
+         VALUES (?, ?, ?, ?, ?, ?, date('now', '+1 hour'), 'approved', 'auto', datetime('now'))`
       )
-      .bind(wishId, p.type, p.id, p.name, isStaff ? null : (p.photo || null), message, isStaff ? "approved" : "pending")
+      .bind(wishId, p.type, p.id, p.name, isStaff ? null : (p.photo || null), message)
       .run();
 
     // Staff: text them automatically, but only for the request that actually
     // created today's wish (the unique index makes repeats no-ops).
     const created = res && res.meta && res.meta.changes === 1;
+
+    // Students appear on the homepage straight away; only their guardian SMS
+    // waits for the admin ('pending'), or is skipped when there is no phone.
+    if (!isStaff && created) {
+      await env.DB
+        .prepare("UPDATE birthday_wishes SET sms_status = ? WHERE id = ?")
+        .bind(p.phone ? "pending" : "skipped", wishId)
+        .run();
+    }
+
     if (isStaff && created) {
       try {
         await sendBirthdaySms(env, { wishId, phone: p.phone, name: p.name, message, type: "staff", personId: p.id });
@@ -4090,10 +4102,10 @@ async function handleBirthdayRoutes(request, env, url) {
                            (SELECT phone FROM users WHERE id = bw.person_id AND bw.person_type = 'staff')) AS phone
            FROM birthday_wishes bw
            WHERE bw.wish_date = date('now', '+1 hour') AND bw.status != 'rejected'
-           ORDER BY (bw.status = 'pending') DESC, bw.created_at ASC`
+           ORDER BY (bw.sms_status = 'pending') DESC, bw.created_at ASC`
         )
         .all();
-      return json({ wishes: results, pendingCount: results.filter(w => w.status === "pending").length });
+      return json({ wishes: results, pendingCount: results.filter(w => w.person_type === "student" && w.sms_status === "pending").length });
     } catch (err) {
       return json({ error: "birthday_wishes table not found — run the migration first.", detail: String((err && err.message) || err) }, 500);
     }
@@ -4124,15 +4136,18 @@ async function handleBirthdayRoutes(request, env, url) {
     return json({ message: "Birthday wish posted to the public page.", id });
   }
 
-  // ---------------- ADMIN: APPROVE / EDIT / REJECT A WISH ----------------
+  // ---------------- ADMIN: EDIT MESSAGE / HIDE / APPROVE OR SKIP THE GUARDIAN SMS ----------------
   const wishPatchMatch = pathname.match(/^\/api\/birthday-wishes\/([^/]+)$/);
   if (wishPatchMatch && request.method === "PATCH") {
     const sessionCtx = await getSession(request, env);
     if (!isGeneralAdmin(sessionCtx)) return json({ error: "Not authorised." }, 403);
 
-    const { status, message, sendSms } = await request.json();
-    if (status && !["approved", "rejected", "pending"].includes(status)) {
-      return json({ error: "status must be approved, rejected or pending." }, 400);
+    const { status, message, smsAction } = await request.json();
+    if (status && !["approved", "rejected"].includes(status)) {
+      return json({ error: "status must be approved or rejected." }, 400);
+    }
+    if (smsAction && !["send", "skip"].includes(smsAction)) {
+      return json({ error: "smsAction must be send or skip." }, 400);
     }
     if (message !== undefined && !String(message).trim()) {
       return json({ error: "The message cannot be empty." }, 400);
@@ -4148,22 +4163,27 @@ async function handleBirthdayRoutes(request, env, url) {
       .bind(status || null, finalMessage, wishPatchMatch[1])
       .run();
 
-    if (status === "rejected") return json({ message: "Skipped — it will not be shown." });
-    if (status !== "approved") return json({ message: "Saved." });
+    if (status === "rejected") return json({ message: "Removed from the homepage." });
 
-    // Approving a student's wish can also text the guardian (once only).
-    let smsNote = "";
-    if (sendSms && existing.person_type === "student" && existing.person_id && !existing.sms_status) {
+    if (smsAction === "skip" && existing.sms_status === "pending") {
+      await env.DB.prepare("UPDATE birthday_wishes SET sms_status = 'declined' WHERE id = ?").bind(existing.id).run();
+      return json({ message: "No SMS will be sent to the guardian." });
+    }
+
+    if (smsAction === "send" && existing.person_type === "student" && existing.person_id && existing.sms_status === "pending") {
       const stu = await env.DB.prepare("SELECT guardian_phone FROM students WHERE id = ?").bind(existing.person_id).first();
       const smsStatus = await sendBirthdaySms(env, {
         wishId: existing.id, phone: stu && stu.guardian_phone, name: existing.name,
         message: finalMessage, type: "student", personId: existing.person_id, sentBy: sessionCtx.id
       });
-      smsNote = smsStatus === "sent" ? " SMS sent to the guardian."
-        : smsStatus === "skipped" ? " No guardian phone on file, so no SMS was sent."
-        : " Published, but the SMS could not be sent.";
+      return json({
+        message: smsStatus === "sent" ? "SMS sent to the guardian."
+          : smsStatus === "skipped" ? "No guardian phone on file, so no SMS was sent."
+          : "The SMS could not be sent. Check the SMS log."
+      });
     }
-    return json({ message: "Approved and published on the homepage." + smsNote });
+
+    return json({ message: "Saved." });
   }
 
   // ---------------- ADMIN: DELETE A WISH ----------------
@@ -4172,7 +4192,13 @@ async function handleBirthdayRoutes(request, env, url) {
     const sessionCtx = await getSession(request, env);
     if (!isGeneralAdmin(sessionCtx)) return json({ error: "Not authorised." }, 403);
 
-    await env.DB.prepare("DELETE FROM birthday_wishes WHERE id = ?").bind(wishDeleteMatch[1]).run();
+    const row = await env.DB.prepare("SELECT source FROM birthday_wishes WHERE id = ?").bind(wishDeleteMatch[1]).first();
+    if (row && row.source === "auto") {
+      // Keep the row (hidden) so the automatic sync doesn't recreate it today.
+      await env.DB.prepare("UPDATE birthday_wishes SET status = 'rejected' WHERE id = ?").bind(wishDeleteMatch[1]).run();
+    } else {
+      await env.DB.prepare("DELETE FROM birthday_wishes WHERE id = ?").bind(wishDeleteMatch[1]).run();
+    }
     return json({ message: "Wish removed." });
   }
 
