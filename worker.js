@@ -879,7 +879,12 @@ async function handleTimetableRoutes(request, env, url) {
     const sessionCtx = await getSession(request, env);
     if (!sessionCtx) return json({ error: "Not authenticated." }, 401);
 
-    const classId = url.searchParams.get("classId");
+    let classId = url.searchParams.get("classId");
+    // A student can only ever see their own class's timetable, whatever classId is sent.
+    if (sessionCtx.type === "student") {
+      classId = sessionCtx.record.class_id;
+      if (!classId) return json({ error: "You have not been placed in a class yet." }, 404);
+    }
     if (!classId) return json({ error: "classId is required." }, 400);
 
     const restriction = adminLevelRestriction(sessionCtx);
