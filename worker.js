@@ -1076,6 +1076,25 @@ async function handleAssignmentRoutes(request, env, url) {
       return json({ error: "classId is required for staff requests." }, 400);
     }
 
+    if (sessionCtx.type === "student") {
+      if (!classId) return json({ error: "You have not been placed in a class yet." }, 404);
+      // Student view: include subject name plus this student's OWN submission status/remark only.
+      const { results } = await env.DB
+        .prepare(
+          `SELECT a.id, a.title, a.description, a.due_date, a.subject_id, a.term, a.session, a.created_at,
+                  sub.name AS subject_name,
+                  s.status AS submission_status, s.submitted_at, s.remark
+           FROM assignments a
+           LEFT JOIN subjects sub ON sub.id = a.subject_id
+           LEFT JOIN assignment_submissions s ON s.assignment_id = a.id AND s.student_id = ?
+           WHERE a.class_id = ? AND a.term = ? AND a.session = ?
+           ORDER BY a.due_date`
+        )
+        .bind(sessionCtx.id, classId, term, session)
+        .all();
+      return json({ classId, term, session, assignments: results });
+    }
+
     const { results } = await env.DB
       .prepare(
         `SELECT id, title, description, due_date, subject_id, term, session, created_at
