@@ -1146,7 +1146,12 @@ async function handleAssignmentRoutes(request, env, url) {
     }
 
     const now = new Date();
-    const due = new Date(assignment.due_date);
+    // A date-only due date (YYYY-MM-DD) means the END of that day (Nigeria time, UTC+1),
+    // so submitting on the due date itself is never counted late.
+    const dueRaw = String(assignment.due_date || "");
+    const due = /^\d{4}-\d{2}-\d{2}$/.test(dueRaw)
+      ? new Date(dueRaw + "T23:59:59+01:00")
+      : new Date(dueRaw);
     const status = now > due ? "late" : "submitted";
 
     const existing = await env.DB
