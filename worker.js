@@ -765,7 +765,7 @@ async function handleAttendanceRoutes(request, env, url) {
            FROM students s
            LEFT JOIN attendance a ON a.student_id = s.id AND a.date = ?
            WHERE s.class_id = ? AND s.status = 'active'
-           ORDER BY s.name`
+           ORDER BY s.name COLLATE NOCASE`
         )
         .bind(date, classId)
         .all();
@@ -842,7 +842,7 @@ async function handleAttendanceRoutes(request, env, url) {
            LEFT JOIN attendance a ON a.student_id = s.id AND a.term = ? AND a.session = ?
            WHERE s.class_id = ? AND s.status = 'active'
            GROUP BY s.id, s.name
-           ORDER BY s.name`
+           ORDER BY s.name COLLATE NOCASE`
         )
         .bind(term, session, classId)
         .all();
@@ -1208,7 +1208,7 @@ async function handleAssignmentRoutes(request, env, url) {
          LEFT JOIN assignment_submissions sub
            ON sub.student_id = s.id AND sub.assignment_id = ?
          WHERE s.class_id = ? AND s.status = 'active'
-         ORDER BY s.name`
+         ORDER BY s.name COLLATE NOCASE`
       )
       .bind(assignmentId, assignment.class_id)
       .all();
@@ -1416,11 +1416,11 @@ async function handleRosterRoutes(request, env, url) {
 
     let stmt;
     if (classId) {
-      stmt = env.DB.prepare("SELECT * FROM students WHERE class_id = ? AND status = 'active' ORDER BY name").bind(classId);
+      stmt = env.DB.prepare("SELECT * FROM students WHERE class_id = ? AND status = 'active' ORDER BY name COLLATE NOCASE").bind(classId);
     } else if (restriction) {
-      stmt = env.DB.prepare("SELECT * FROM students WHERE status = 'active' AND level = ? ORDER BY name").bind(restriction);
+      stmt = env.DB.prepare("SELECT * FROM students WHERE status = 'active' AND level = ? ORDER BY name COLLATE NOCASE").bind(restriction);
     } else {
-      stmt = env.DB.prepare("SELECT * FROM students WHERE status = 'active' ORDER BY name");
+      stmt = env.DB.prepare("SELECT * FROM students WHERE status = 'active' ORDER BY name COLLATE NOCASE");
     }
 
     const { results } = await stmt.all();
@@ -1733,7 +1733,7 @@ async function handleRosterRoutes(request, env, url) {
          LEFT JOIN student_pins sp
            ON sp.student_id = s.id AND sp.term = ? AND sp.session = ?
          WHERE s.class_id = ? AND s.status = 'active'
-         ORDER BY s.name`
+         ORDER BY s.name COLLATE NOCASE`
       )
       .bind(term, session, classId)
       .all();
@@ -2664,7 +2664,7 @@ async function handleFeesRoutes(request, env, url) {
            ON ft.student_id = s.id AND ft.term = ? AND ft.session = ?
          WHERE s.class_id = ? AND s.status = 'active'
          GROUP BY s.id, s.name
-         ORDER BY s.name`
+         ORDER BY s.name COLLATE NOCASE`
       )
       .bind(term, session, classId)
       .all();
@@ -3940,7 +3940,7 @@ async function todaysBirthdayPeople(env) {
        FROM students s LEFT JOIN classes c ON c.id = s.class_id
        WHERE s.status = 'active' AND s.dob IS NOT NULL
          AND strftime('%m-%d', s.dob) = strftime('%m-%d', 'now', '+1 hour')
-       ORDER BY s.name`
+       ORDER BY s.name COLLATE NOCASE`
     )
     .all();
 
@@ -4426,7 +4426,7 @@ async function handleResultsRoutes(request, env, url) {
          LEFT JOIN results r
            ON r.student_id = s.id AND r.subject_id = ? AND r.term = ? AND r.session = ?
          WHERE s.class_id = ? AND s.status = 'active'
-         ORDER BY s.name`
+         ORDER BY s.name COLLATE NOCASE`
       )
       .bind(subjectId, term, session, classId)
       .all();
@@ -4464,7 +4464,7 @@ async function handleResultsRoutes(request, env, url) {
          JOIN students s ON s.id = r.student_id
          JOIN subjects sub ON sub.id = r.subject_id
          WHERE r.class_id = ? AND r.term = ? AND r.session = ? AND r.status = ?
-         ORDER BY s.name, sub.name`
+         ORDER BY s.name COLLATE NOCASE, sub.name`
       )
       .bind(classId, term, session, status)
       .all();
@@ -4498,7 +4498,7 @@ async function handleResultsRoutes(request, env, url) {
          LEFT JOIN results r
            ON r.student_id = s.id AND r.class_id = ? AND r.term = ? AND r.session = ?
          WHERE s.class_id = ? AND s.status = 'active'
-         ORDER BY s.name`
+         ORDER BY s.name COLLATE NOCASE`
       )
       .bind(classId, term, session, classId)
       .all();
