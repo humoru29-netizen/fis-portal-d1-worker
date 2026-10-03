@@ -5176,6 +5176,99 @@ function corsHeaders() {
   };
 }
 
+// =====================================================================
+// NIGHTLY D1 BACKUP -> TELEGRAM
+// Runs from a Cron Trigger (see wrangler.toml). Asks Cloudflare to export
+// the whole database as a .sql file, then sends that file to your Telegram
+// bot chat. If anything fails, a short failure message is sent instead.
+// Needs: vars ACCOUNT_ID, DATABASE_ID, TELEGRAM_CHAT_ID and the secrets
+// D1_REST_API_TOKEN and TELEGRAM_BOT_TOKEN.
+// =====================================================================
+const TELEGRAM_MAX_BYTES = 45 * 1024 * 1024; // Telegram bots can upload up to 50 MB
+
+function sleepMs(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function telegramSendMessage(env, text) {
+  if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) return;
+  try {
+    await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: env.TELEGRAM_CHAT_ID, text: String(text).slice(0, 3500) })
+    });
+  } catch (_) { /* nothing more we can do */ }
+}
+
+async function backupDatabaseToTelegram(env) {
+  if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID || !env.D1_REST_API_TOKEN || !env.ACCOUNT_ID || !env.DATABASE_ID) {
+    throw new Error("Backup is not configured: need TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, D1_REST_API_TOKEN, ACCOUNT_ID and DATABASE_ID.");
+  }
+
+  const url = `https://api.cloudflare.com/client/v4/accounts/${env.ACCOUNT_ID}/d1/database/${env.DATABASE_ID}/export`;
+  const headers = {
+    "Content-Type": "application/json",
+    "Authorization": `Bearer ${env.D1_REST_API_TOKEN}`
+  };
+
+  async function callExport(payload) {
+    const res = await fetch(url, { method: "POST", headers, body: JSON.stringify(payload) });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data.success === false) {
+      throw new Error(`D1 export API error (${res.status}): ${JSON.stringify(data.errors || data).slice(0, 300)}`);
+    }
+    return data.result || {};
+  }
+
+  // 1) Start the export
+  let result = await callExport({ output_format: "polling" });
+  const bookmark = result.at_bookmark;
+  if (!bookmark) throw new Error("Export did not return a bookmark.");
+
+  // 2) Poll until the download link is ready (about 4 minutes at most)
+  const pick = (r) => (r && r.result && r.result.signed_url ? r.result : r);
+  let out = pick(result);
+  for (let i = 0; i < 60 && !(out && out.signed_url); i++) {
+    await sleepMs(4000);
+    result = await callExport({ output_format: "polling", current_bookmark: bookmark });
+    if (result.status === "error") throw new Error("D1 export failed: " + JSON.stringify(result.error || result.messages || "").slice(0, 300));
+    out = pick(result);
+  }
+  if (!out || !out.signed_url) throw new Error("Export was not ready in time.");
+
+  // 3) Download the .sql file
+  const dump = await fetch(out.signed_url);
+  if (!dump.ok) throw new Error("Could not download the export file (" + dump.status + ").");
+  const bytes = await dump.arrayBuffer();
+  if (bytes.byteLength < 100) throw new Error("Backup file looks empty.");
+
+  const day = new Date().toISOString().slice(0, 10); // YYYY-MM-DD (UTC)
+  const filename = `fis-portal-db-${day}.sql`;
+  const kb = Math.round(bytes.byteLength / 1024);
+
+  if (bytes.byteLength > TELEGRAM_MAX_BYTES) {
+    throw new Error(`Backup is ${kb} KB, too large to send on Telegram. Time to move to a bigger backup method.`);
+  }
+
+  // 4) Send it to Telegram
+  const form = new FormData();
+  form.append("chat_id", String(env.TELEGRAM_CHAT_ID));
+  form.append("caption", `FIS Portal backup ${day} (${kb} KB)`);
+  form.append("document", new Blob([bytes], { type: "application/sql" }), filename);
+
+  const tgRes = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendDocument`, {
+    method: "POST",
+    body: form
+  });
+  const tgData = await tgRes.json().catch(() => ({}));
+  if (!tgRes.ok || !tgData.ok) {
+    throw new Error("Telegram rejected the backup: " + String(tgData.description || tgRes.status).slice(0, 200));
+  }
+
+  console.log(`Backup sent to Telegram: ${filename} (${kb} KB).`);
+}
+
 export default {
   async fetch(request, env) {
     if (request.method === "OPTIONS") {
@@ -5220,5 +5313,17 @@ export default {
       status: 404,
       headers: { "Content-Type": "application/json", ...corsHeaders() }
     });
+  },
+
+  // Runs on the Cron Trigger in wrangler.toml (nightly backup to Telegram)
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(
+      backupDatabaseToTelegram(env).catch(async (err) => {
+        const msg = String(err && err.message || err);
+        console.error("Nightly backup FAILED:", msg);
+        await telegramSendMessage(env, "FIS Portal nightly backup FAILED: " + msg);
+        throw err;
+      })
+    );
   }
 };
