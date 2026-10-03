@@ -13,7 +13,7 @@ ACCOUNT_ID = "ce44a9a27f292ae29ed3f882ea2539c2"
 TELEGRAM_CHAT_ID = "6904579516"
 
 [triggers]
-crons = ["0 1 * * *"]
+crons = ["*/5 * * * *"].
 
 [observability]
 enabled = true
