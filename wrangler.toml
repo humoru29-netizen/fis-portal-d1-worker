@@ -6,3 +6,14 @@ compatibility_date = "2025-01-01"
 binding = "DB"
 database_name = "fis-portal-db"
 database_id = "9521bb8d-ea7a-4f30-aec8-f4ef075ca72a"
+
+[vars]
+DATABASE_ID = "9521bb8d-ea7a-4f30-aec8-f4ef075ca72a"
+ACCOUNT_ID = "ce44a9a27f292ae29ed3f882ea2539c2"
+TELEGRAM_CHAT_ID = "6904579516"
+
+[triggers]
+crons = ["0 1 * * *"]
+
+[observability]
+enabled = true
