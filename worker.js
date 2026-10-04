@@ -2446,6 +2446,13 @@ function isFeeStaff(session) {
   return isStaff(session) && ["cashier", "general_admin", "primary_admin", "secondary_admin"].includes(session.role);
 }
 
+
+// Receipt numbers are saved with each payment (fee_transactions.receipt_seq) and
+// shown as FIS-RCT-000123. Old payments are numbered once by the migration SQL.
+function formatReceiptNo(seq) {
+  return seq ? "FIS-RCT-" + String(seq).padStart(6, "0") : null;
+}
+
 async function handleFeesRoutes(request, env, url) {
   const { pathname } = url;
 
@@ -2537,14 +2544,32 @@ async function handleFeesRoutes(request, env, url) {
 
     const id = uuid();
     const recordedAt = new Date().toISOString();
-    await env.DB
-      .prepare(
-        `INSERT INTO fee_transactions
-           (id, student_id, student_name_snapshot, amount, type, term, session, recorded_by, recorded_at, notes)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-      )
-      .bind(id, studentId, student.name, Number(amount), type, term, session, sessionCtx.id, recordedAt, notes || null)
-      .run();
+    let receiptNo = null;
+    try {
+      // The next number is worked out inside the same statement, so two cashiers
+      // saving at the same moment can never get the same receipt number.
+      await env.DB
+        .prepare(
+          `INSERT INTO fee_transactions
+             (id, student_id, student_name_snapshot, amount, type, term, session, recorded_by, recorded_at, notes, receipt_seq)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (SELECT COALESCE(MAX(receipt_seq), 0) + 1 FROM fee_transactions))`
+        )
+        .bind(id, studentId, student.name, Number(amount), type, term, session, sessionCtx.id, recordedAt, notes || null)
+        .run();
+      const seqRow = await env.DB.prepare("SELECT receipt_seq FROM fee_transactions WHERE id = ?").bind(id).first();
+      receiptNo = formatReceiptNo(seqRow && seqRow.receipt_seq);
+    } catch (err) {
+      // Safety net: if the receipt_seq column has not been added yet, still record the payment.
+      if (!String(err && err.message || err).includes("receipt_seq")) throw err;
+      await env.DB
+        .prepare(
+          `INSERT INTO fee_transactions
+             (id, student_id, student_name_snapshot, amount, type, term, session, recorded_by, recorded_at, notes)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        )
+        .bind(id, studentId, student.name, Number(amount), type, term, session, sessionCtx.id, recordedAt, notes || null)
+        .run();
+    }
 
     const structure = await env.DB
       .prepare("SELECT amount FROM fee_structures WHERE class_id = ? AND term = ? AND session = ?")
@@ -2562,6 +2587,7 @@ async function handleFeesRoutes(request, env, url) {
       message: "Payment recorded.",
       id,
       receipt: {
+        receiptNo,
         studentName: student.name,
         admissionNo: student.admission_no,
         amount: Number(amount),
@@ -2611,15 +2637,32 @@ async function handleFeesRoutes(request, env, url) {
       .first();
     const totalPaid = paidRow.total;
 
-    const { results: transactions } = await env.DB
-      .prepare(
-        `SELECT id, amount, type, notes, recorded_at
-         FROM fee_transactions
-         WHERE student_id = ? AND term = ? AND session = ?
-         ORDER BY recorded_at DESC`
-      )
-      .bind(studentId, term, session)
-      .all();
+    let transactions;
+    try {
+      const { results } = await env.DB
+        .prepare(
+          `SELECT id, amount, type, notes, recorded_at, receipt_seq
+           FROM fee_transactions
+           WHERE student_id = ? AND term = ? AND session = ?
+           ORDER BY recorded_at DESC`
+        )
+        .bind(studentId, term, session)
+        .all();
+      transactions = results.map(t => ({ ...t, receiptNo: formatReceiptNo(t.receipt_seq) }));
+    } catch (err) {
+      // Safety net: column not added yet, so show the history without numbers
+      if (!String(err && err.message || err).includes("receipt_seq")) throw err;
+      const { results } = await env.DB
+        .prepare(
+          `SELECT id, amount, type, notes, recorded_at
+           FROM fee_transactions
+           WHERE student_id = ? AND term = ? AND session = ?
+           ORDER BY recorded_at DESC`
+        )
+        .bind(studentId, term, session)
+        .all();
+      transactions = results;
+    }
 
     return json({
       studentId,
