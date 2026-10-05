@@ -1826,15 +1826,34 @@ async function handleRosterRoutes(request, env, url) {
       if (!cls || cls.level !== restriction) return json({ error: "Not authorised for this class." }, 403);
     }
 
-    const studentCount = await env.DB
+    // Anything that would make D1 refuse the delete (or orphan data) is checked first,
+    // so the admin gets a plain-English reason instead of a vague failure.
+    const countOf = async (table) => {
+      const r = await env.DB.prepare(`SELECT COUNT(*) AS count FROM ${table} WHERE class_id = ?`).bind(classId).first();
+      return (r && r.count) || 0;
+    };
+    const activeStudents = await env.DB
       .prepare("SELECT COUNT(*) AS count FROM students WHERE class_id = ? AND status = 'active'")
-      .bind(classId)
-      .first();
-    if (studentCount && studentCount.count > 0) {
-      return json({ error: "This class still has students in it. Move or remove them first." }, 409);
+      .bind(classId).first();
+    if (activeStudents && activeStudents.count > 0) {
+      return json({ error: `This class still has ${activeStudents.count} active student(s). Move them (Promote tab / edit student) first.` }, 409);
+    }
+    const blockers = [];
+    const otherStudents = await countOf("students");
+    if (otherStudents > 0) blockers.push(`${otherStudents} inactive/graduated student record(s)`);
+    for (const [table, label] of [["results", "result record(s)"], ["attendance", "attendance record(s)"], ["assignments", "assignment(s)"]]) {
+      const n = await countOf(table);
+      if (n > 0) blockers.push(`${n} ${label}`);
+    }
+    if (blockers.length) {
+      return json({ error: `Can't delete this class because it still has ${blockers.join(", ")}. Deleting would erase that history.` }, 409);
     }
 
+    // Safe to remove: only setup data remains.
     await env.DB.prepare("DELETE FROM class_subjects WHERE class_id = ?").bind(classId).run();
+    await env.DB.prepare("DELETE FROM teacher_assignments WHERE class_id = ?").bind(classId).run();
+    await env.DB.prepare("DELETE FROM timetable_slots WHERE class_id = ?").bind(classId).run();
+    await env.DB.prepare("UPDATE classes SET next_class_id = NULL WHERE next_class_id = ?").bind(classId).run();
     await env.DB.prepare("DELETE FROM classes WHERE id = ?").bind(classId).run();
 
     return json({ message: "Class deleted." });
@@ -1854,18 +1873,29 @@ async function handleRosterRoutes(request, env, url) {
       return json({ error: "Not authorised for this class." }, 403);
     }
 
-    const { nextClassId } = await request.json();
-    let normalizedNextClassId = null;
-    if (nextClassId) {
-      if (nextClassId === classId) {
-        return json({ error: "A class can't promote into itself." }, 400);
-      }
-      const target = await env.DB.prepare("SELECT id FROM classes WHERE id = ?").bind(nextClassId).first();
-      if (!target) return json({ error: "Target class not found." }, 404);
-      normalizedNextClassId = nextClassId;
+    const body = await request.json();
+
+    // Rename
+    if (typeof body.name === "string") {
+      const newName = body.name.trim();
+      if (!newName) return json({ error: "Class name can't be empty." }, 400);
+      await env.DB.prepare("UPDATE classes SET name = ? WHERE id = ?").bind(newName, classId).run();
     }
 
-    await env.DB.prepare("UPDATE classes SET next_class_id = ? WHERE id = ?").bind(normalizedNextClassId, classId).run();
+    // Promotion target
+    if ("nextClassId" in body) {
+      const nextClassId = body.nextClassId;
+      let normalizedNextClassId = null;
+      if (nextClassId) {
+        if (nextClassId === classId) {
+          return json({ error: "A class can't promote into itself." }, 400);
+        }
+        const target = await env.DB.prepare("SELECT id FROM classes WHERE id = ?").bind(nextClassId).first();
+        if (!target) return json({ error: "Target class not found." }, 404);
+        normalizedNextClassId = nextClassId;
+      }
+      await env.DB.prepare("UPDATE classes SET next_class_id = ? WHERE id = ?").bind(normalizedNextClassId, classId).run();
+    }
     return json({ message: "Saved." });
   }
 
