@@ -352,6 +352,59 @@ function json(data, status = 200) {
   });
 }
 
+// =====================================================================
+// AI class-list reader (handwriting-capable). Needs secret ANTHROPIC_API_KEY.
+// =====================================================================
+async function scanRosterImage(request, env) {
+  if (!env.ANTHROPIC_API_KEY) return json({ error: "AI reader not set up yet." }, 501);
+
+  let body;
+  try { body = await request.json(); } catch { return json({ error: "Bad request." }, 400); }
+  const image = body && body.image;
+  if (!image || image.length > 7000000) return json({ error: "Photo missing or too large." }, 400);
+
+  let res;
+  try {
+    res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "x-api-key": env.ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-6",
+        max_tokens: 1500,
+        messages: [{
+          role: "user",
+          content: [
+            { type: "image", source: { type: "base64", media_type: body.mediaType || "image/jpeg", data: image } },
+            { type: "text", text:
+              "This is a photo of a school class list (possibly handwritten). " +
+              "Extract ONLY the student names, in the order written, one per entry. " +
+              "Ignore the title, dates, row numbers, headers, scores, and any admission or other numbers. " +
+              "Keep the full name as written (surname and other names together). " +
+              "If a name is unclear, give your best reading. " +
+              "Reply with ONLY a JSON array of strings, e.g. [\"Ahmed Abdulrahman\",\"Precious Okafor\"]. " +
+              "If there are no names, reply []." }
+          ]
+        }]
+      })
+    });
+  } catch {
+    return json({ error: "AI reader could not be reached. Try again or type the names." }, 502);
+  }
+  if (!res.ok) return json({ error: "AI reader is unavailable right now. Try again or type the names." }, 502);
+
+  const data = await res.json();
+  const text = (data.content || []).map(c => c.text || "").join("").replace(/```json|```/g, "").trim();
+  let names = [];
+  try { names = JSON.parse(text); } catch { names = []; }
+  if (!Array.isArray(names)) names = [];
+  names = names.map(n => String(n).trim()).filter(n => n.length > 1).slice(0, 200);
+  return json({ names });
+}
+
 function uuid() {
   return crypto.randomUUID();
 }
@@ -1425,6 +1478,13 @@ async function handleRosterRoutes(request, env, url) {
 
     const { results } = await stmt.all();
     return json({ students: results });
+  }
+
+  // ---------------- SCAN CLASS LIST PHOTO (AI reader) ----------------
+  if (pathname === "/api/scan-roster" && request.method === "POST") {
+    const sessionCtx = await getSession(request, env);
+    if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
+    return scanRosterImage(request, env);
   }
 
   // ---------------- CREATE STUDENT ----------------
