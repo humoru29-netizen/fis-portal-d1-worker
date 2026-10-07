@@ -1381,7 +1381,8 @@ async function handleAssignmentRoutes(request, env, url) {
 
 /**
  * Works out which admission-number series a student belongs to:
- *   secondary -> FISS/<year>/<4-digit sequence>   e.g. FISS/2026/0001 (resets each calendar year)
+ *   secondary -> FISS/<admission year>/<4-digit sequence>   e.g. FISS/2024/0001
+ *                (each admission year counts on its own, taken from the student's Session Joined)
  *   nursery   -> FIS/N/<4-digit sequence>         e.g. FIS/N/0001
  *   primary   -> FIS/P/<4-digit sequence>         e.g. FIS/P/0001
  * Nursery is not a separate level in the database (those classes are stored
@@ -1398,10 +1399,22 @@ function admissionSection(level, className) {
  * Each series counts separately, so primary and nursery start from 0001
  * and no longer continue from where secondary stopped.
  */
-async function generateAdmissionNo(env, level, className) {
+/**
+ * The year that goes into a secondary admission number: the first year of the
+ * student's "Session Joined" (e.g. "2024/2025" -> 2024). With no session given it
+ * falls back to the current session's start year (the school year starts in September).
+ */
+function admissionYearFor(sessionJoined) {
+  const m = String(sessionJoined || "").match(/(?:19|20)\d{2}/);
+  if (m) return m[0];
+  const now = new Date();
+  return String(now.getMonth() >= 8 ? now.getFullYear() : now.getFullYear() - 1);
+}
+
+async function generateAdmissionNo(env, level, className, sessionJoined) {
   const section = admissionSection(level, className);
   let prefix;
-  if (section === "secondary") prefix = `FISS/${new Date().getFullYear()}/`;
+  if (section === "secondary") prefix = `FISS/${admissionYearFor(sessionJoined)}/`;
   else if (section === "nursery") prefix = "FIS/N/";
   else prefix = "FIS/P/";
 
@@ -1518,8 +1531,12 @@ async function handleRosterRoutes(request, env, url) {
       return json({ error: `As a ${restriction} admin, you can only add ${restriction} students.` }, 403);
     }
 
+    if (level === "secondary" && !/(?:19|20)\d{2}/.test(sessionJoined || "")) {
+      return json({ error: "Enter the session this student joined (for example 2024/2025). It sets the year in the admission number." }, 400);
+    }
+
     const classRow = await env.DB.prepare("SELECT name FROM classes WHERE id = ?").bind(classId).first();
-    const admissionNo = await generateAdmissionNo(env, level, classRow ? classRow.name : "");
+    const admissionNo = await generateAdmissionNo(env, level, classRow ? classRow.name : "", sessionJoined);
     const id = uuid();
     await env.DB
       .prepare(
