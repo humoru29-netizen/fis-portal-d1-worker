@@ -1380,13 +1380,30 @@ async function handleAssignmentRoutes(request, env, url) {
  */
 
 /**
- * Generates the next admission number in the school's existing format,
- * FISS/<year>/<4-digit sequence>, e.g. FISS/2026/0001. The sequence resets
- * per calendar year, scanning existing admission numbers for that year.
+ * Works out which admission-number series a student belongs to:
+ *   secondary -> FISS/<year>/<4-digit sequence>   e.g. FISS/2026/0001 (resets each calendar year)
+ *   nursery   -> FIS/N/<4-digit sequence>         e.g. FIS/N/0001
+ *   primary   -> FIS/P/<4-digit sequence>         e.g. FIS/P/0001
+ * Nursery is not a separate level in the database (those classes are stored
+ * under level "primary"), so it is recognised by the class name.
  */
-async function generateAdmissionNo(env) {
-  const year = new Date().getFullYear();
-  const prefix = `FISS/${year}/`;
+function admissionSection(level, className) {
+  if (level === "secondary") return "secondary";
+  if (/nursery|cr[eè]che|kindergarten|\bkg\b|pre-?school|play-?group|reception/i.test(className || "")) return "nursery";
+  return "primary";
+}
+
+/**
+ * Generates the next admission number for the student's own series.
+ * Each series counts separately, so primary and nursery start from 0001
+ * and no longer continue from where secondary stopped.
+ */
+async function generateAdmissionNo(env, level, className) {
+  const section = admissionSection(level, className);
+  let prefix;
+  if (section === "secondary") prefix = `FISS/${new Date().getFullYear()}/`;
+  else if (section === "nursery") prefix = "FIS/N/";
+  else prefix = "FIS/P/";
 
   const { results } = await env.DB
     .prepare("SELECT admission_no FROM students WHERE admission_no LIKE ? ORDER BY admission_no DESC LIMIT 1")
@@ -1501,7 +1518,8 @@ async function handleRosterRoutes(request, env, url) {
       return json({ error: `As a ${restriction} admin, you can only add ${restriction} students.` }, 403);
     }
 
-    const admissionNo = await generateAdmissionNo(env);
+    const classRow = await env.DB.prepare("SELECT name FROM classes WHERE id = ?").bind(classId).first();
+    const admissionNo = await generateAdmissionNo(env, level, classRow ? classRow.name : "");
     const id = uuid();
     await env.DB
       .prepare(
@@ -2318,7 +2336,7 @@ async function handleAdmissionRoutes(request, env, url) {
     if (!classId) return json({ error: "classId is required to approve an application." }, 400);
 
     const targetClass = await env.DB
-      .prepare("SELECT id, level FROM classes WHERE id = ?")
+      .prepare("SELECT id, name, level FROM classes WHERE id = ?")
       .bind(classId)
       .first();
     if (!targetClass) return json({ error: "Class not found." }, 404);
@@ -2326,7 +2344,7 @@ async function handleAdmissionRoutes(request, env, url) {
       return json({ error: "Not authorised for this class." }, 403);
     }
 
-    const admissionNo = await generateAdmissionNo(env);
+    const admissionNo = await generateAdmissionNo(env, targetClass.level, targetClass.name);
     const studentId = uuid();
 
     await env.DB
