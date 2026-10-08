@@ -671,6 +671,7 @@ async function handleStudentAuthRoutes(request, env, url) {
           admissionNo: student.admission_no,
           classId: student.class_id,
           level: student.level,
+          gender: student.gender || null,
           photoUrl: student.photo_key || null
         }
       });
@@ -685,7 +686,7 @@ async function handleStudentAuthRoutes(request, env, url) {
       const s = sessionCtx.record;
       return json({
         id: s.id, name: s.name, admissionNo: s.admission_no,
-        classId: s.class_id, level: s.level, photoUrl: s.photo_key || null
+        classId: s.class_id, level: s.level, gender: s.gender || null, photoUrl: s.photo_key || null
       });
     }
 
@@ -2937,7 +2938,7 @@ async function handleReportCardRoutes(request, env, url) {
 
     const student = await env.DB
       .prepare(
-        `SELECT s.id, s.name, s.admission_no, s.class_id, s.photo_key, s.dob, c.name AS class_name, c.level
+        `SELECT s.id, s.name, s.admission_no, s.class_id, s.photo_key, s.dob, s.gender, c.name AS class_name, c.level
          FROM students s JOIN classes c ON c.id = s.class_id
          WHERE s.id = ?`
       )
@@ -3000,7 +3001,12 @@ async function handleReportCardRoutes(request, env, url) {
 
     const rankIndex = classAverages.findIndex(r => r.student_id === studentId);
     const position = rankIndex === -1 ? null : rankIndex + 1;
-    const outOf = classAverages.length;
+    // "Out of" = number of students in the class (not just those with released results)
+    const classSizeRow = await env.DB
+      .prepare("SELECT COUNT(*) AS count FROM students WHERE class_id = ? AND status = 'active'")
+      .bind(student.class_id)
+      .first();
+    const outOf = Math.max(classAverages.length, (classSizeRow && classSizeRow.count) || 0);
 
     // ---- Attendance for the term ----
     const attendance = await env.DB
@@ -3042,6 +3048,7 @@ async function handleReportCardRoutes(request, env, url) {
         className: student.class_name,
         level: student.level,
         dob: student.dob || null,
+        gender: student.gender || null,
         photoUrl: student.photo_key || null
       },
       term,
@@ -4660,7 +4667,7 @@ async function handleResultsRoutes(request, env, url) {
 
     const { results: rows } = await env.DB
       .prepare(
-        `SELECT s.id AS student_id, s.name AS student_name, s.admission_no,
+        `SELECT s.id AS student_id, s.name AS student_name, s.admission_no, s.gender,
                 r.status
          FROM students s
          LEFT JOIN results r
@@ -4678,6 +4685,7 @@ async function handleResultsRoutes(request, env, url) {
           student_id: row.student_id,
           student_name: row.student_name,
           admission_no: row.admission_no,
+          gender: row.gender || null,
           total: 0,
           approved: 0,
           pending: 0,
@@ -4997,7 +5005,11 @@ async function handleSmsRoutes(request, env, url) {
       .bind(classId, term, session)
       .all();
 
-    const outOf = classAverages.length;
+    const classSizeRow = await env.DB
+      .prepare("SELECT COUNT(*) AS count FROM students WHERE class_id = ? AND status = 'active'")
+      .bind(classId)
+      .first();
+    const outOf = Math.max(classAverages.length, (classSizeRow && classSizeRow.count) || 0);
     const rankById = {};
     classAverages.forEach((row, idx) => { rankById[row.student_id] = idx + 1; });
     const avgById = {};
