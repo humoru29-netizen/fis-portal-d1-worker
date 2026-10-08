@@ -2564,6 +2564,7 @@ async function handleManageAccountsRoutes(request, env, url) {
  *   POST /api/fee-structures                  (auth: admin) set/update the fee amount for a class/term/session
  *   GET  /api/fee-structures?term=&session=   (auth: cashier/admin) list fee amount per class for a term
  *   POST /api/fees/payments                   (auth: cashier/admin) record a payment — ALWAYS live, never queued offline
+ *   PATCH /api/fees/payments/:id              (auth: admin, not cashier) correct amount/type/notes or void a payment; reason required
  *   GET  /api/fees/student/:studentId?term=&session=  (auth: cashier/admin, or the student viewing their own) fee owed, paid, balance, and payment history
  *   GET  /api/fees/class/:classId?term=&session=      (auth: cashier/admin) per-student paid/balance for a class
  *   GET  /api/fees/totals?term=&session=              (auth: cashier/admin) amount collected today/this week/this month/this term
@@ -2727,6 +2728,62 @@ async function handleFeesRoutes(request, env, url) {
         balance: feeAmount - totalPaid
       }
     });
+  }
+
+  // ---------------- CORRECT OR VOID A PAYMENT (admins only, reason required) ----------------
+  // The payment is never deleted: the receipt number stays, and the note records
+  // what it was before, when, and why. A void sets the amount to 0.
+  const paymentFixMatch = pathname.match(/^\/api\/fees\/payments\/([^/]+)$/);
+  if (paymentFixMatch && request.method === "PATCH") {
+    const sessionCtx = await getSession(request, env);
+    if (!isFeeStaff(sessionCtx) || sessionCtx.role === "cashier") {
+      return json({ error: "Only an admin can correct a payment." }, 403);
+    }
+
+    const body = await request.json();
+    const reason = String(body.reason || "").trim();
+    if (!reason) return json({ error: "Please give a reason for the correction." }, 400);
+
+    const tx = await env.DB
+      .prepare("SELECT id, student_id, amount, type, notes FROM fee_transactions WHERE id = ?")
+      .bind(paymentFixMatch[1])
+      .first();
+    if (!tx) return json({ error: "Payment not found." }, 404);
+
+    const stu = await env.DB.prepare("SELECT level FROM students WHERE id = ?").bind(tx.student_id).first();
+    const restriction = adminLevelRestriction(sessionCtx);
+    if (restriction && stu && stu.level !== restriction) {
+      return json({ error: "Not authorised for this student." }, 403);
+    }
+
+    const isVoid = body.void === true;
+    let newAmount = Number(tx.amount);
+    if (isVoid) {
+      newAmount = 0;
+    } else if (body.amount !== undefined && body.amount !== null && body.amount !== "") {
+      if (isNaN(body.amount) || Number(body.amount) <= 0) {
+        return json({ error: "amount must be a positive number." }, 400);
+      }
+      newAmount = Number(body.amount);
+    }
+    const newType = (!isVoid && body.type) ? String(body.type) : tx.type;
+
+    const baseNotes = (body.notes !== undefined && body.notes !== null) ? String(body.notes).trim() : (tx.notes || "");
+    const changes = [];
+    if (newAmount !== Number(tx.amount)) changes.push("amount " + Number(tx.amount) + " to " + newAmount);
+    if (newType !== tx.type) changes.push("type " + tx.type + " to " + newType);
+    const stamp = new Date().toISOString().slice(0, 10);
+    const marker = "[" + (isVoid ? "VOIDED" : "CORRECTED") + " " + stamp +
+      (isVoid ? ", was " + Number(tx.amount) : (changes.length ? ": " + changes.join(", ") : "")) +
+      ". Reason: " + reason + "]";
+    const finalNotes = (baseNotes ? baseNotes + " " : "") + marker;
+
+    await env.DB
+      .prepare("UPDATE fee_transactions SET amount = ?, type = ?, notes = ? WHERE id = ?")
+      .bind(newAmount, newType, finalNotes, tx.id)
+      .run();
+
+    return json({ message: isVoid ? "Payment voided." : "Payment corrected." });
   }
 
   // ---------------- STUDENT FEE STATUS + HISTORY ----------------
