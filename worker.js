@@ -1523,7 +1523,7 @@ async function handleRosterRoutes(request, env, url) {
     const sessionCtx = await getSession(request, env);
     if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
 
-    const { name, classId, level, sessionJoined, guardianName, guardianPhone } = await request.json();
+    const { name, classId, level, sessionJoined, guardianName, guardianPhone, gender } = await request.json();
     if (!name || !classId || !level) {
       return json({ error: "name, classId, and level are required." }, 400);
     }
@@ -1541,10 +1541,10 @@ async function handleRosterRoutes(request, env, url) {
     const id = uuid();
     await env.DB
       .prepare(
-        `INSERT INTO students (id, admission_no, name, class_id, level, session_joined, guardian_name, guardian_phone, status, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', datetime('now'))`
+        `INSERT INTO students (id, admission_no, name, class_id, level, session_joined, guardian_name, guardian_phone, gender, status, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', datetime('now'))`
       )
-      .bind(id, admissionNo, name, classId, level, sessionJoined || null, guardianName || null, guardianPhone || null)
+      .bind(id, admissionNo, name, classId, level, sessionJoined || null, guardianName || null, guardianPhone || null, (gender === "Male" || gender === "Female") ? gender : null)
       .run();
 
     return json({ message: "Student added.", id, admissionNo });
@@ -2043,7 +2043,7 @@ async function handleRosterRoutes(request, env, url) {
       return json({ error: "Not authorised for this student." }, 403);
     }
 
-    const { name, classId, sessionJoined, guardianName, guardianPhone, dob } = await request.json();
+    const { name, classId, sessionJoined, guardianName, guardianPhone, dob, gender } = await request.json();
     if (!name || !classId) {
       return json({ error: "name and classId are required." }, 400);
     }
@@ -2061,10 +2061,10 @@ async function handleRosterRoutes(request, env, url) {
 
     await env.DB
       .prepare(
-        `UPDATE students SET name = ?, class_id = ?, level = ?, session_joined = ?, guardian_name = ?, guardian_phone = ?, dob = ?
+        `UPDATE students SET name = ?, class_id = ?, level = ?, session_joined = ?, guardian_name = ?, guardian_phone = ?, dob = ?, gender = COALESCE(?, gender)
          WHERE id = ?`
       )
-      .bind(name, classId, newLevel, sessionJoined || null, guardianName || null, guardianPhone || null, dob || null, studentId)
+      .bind(name, classId, newLevel, sessionJoined || null, guardianName || null, guardianPhone || null, dob || null, (gender === "Male" || gender === "Female") ? gender : null, studentId)
       .run();
 
     return json({ message: "Student updated." });
@@ -2367,10 +2367,10 @@ async function handleAdmissionRoutes(request, env, url) {
 
     await env.DB
       .prepare(
-        `INSERT INTO students (id, admission_no, name, class_id, level, guardian_name, guardian_phone, photo_key, status, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', datetime('now'))`
+        `INSERT INTO students (id, admission_no, name, class_id, level, guardian_name, guardian_phone, photo_key, gender, status, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', datetime('now'))`
       )
-      .bind(studentId, admissionNo, application.student_name, classId, targetClass.level, application.guardian_name, application.guardian_phone, application.photo_url || null)
+      .bind(studentId, admissionNo, application.student_name, classId, targetClass.level, application.guardian_name, application.guardian_phone, application.photo_url || null, application.gender || null)
       .run();
 
     await env.DB
@@ -2936,14 +2936,28 @@ async function handleReportCardRoutes(request, env, url) {
     const session = url.searchParams.get("session");
     if (!term || !session) return json({ error: "term and session are required." }, 400);
 
-    const student = await env.DB
-      .prepare(
-        `SELECT s.id, s.name, s.admission_no, s.class_id, s.photo_key, s.dob, s.gender, c.name AS class_name, c.level
-         FROM students s JOIN classes c ON c.id = s.class_id
-         WHERE s.id = ?`
-      )
-      .bind(studentId)
-      .first();
+    // Gender needs the students.gender column (see migration note near the bottom of this file);
+    // fall back gracefully if it has not been added yet so report cards keep working.
+    let student;
+    try {
+      student = await env.DB
+        .prepare(
+          `SELECT s.id, s.name, s.admission_no, s.class_id, s.photo_key, s.dob, s.gender, c.name AS class_name, c.level
+           FROM students s JOIN classes c ON c.id = s.class_id
+           WHERE s.id = ?`
+        )
+        .bind(studentId)
+        .first();
+    } catch (e) {
+      student = await env.DB
+        .prepare(
+          `SELECT s.id, s.name, s.admission_no, s.class_id, s.photo_key, s.dob, c.name AS class_name, c.level
+           FROM students s JOIN classes c ON c.id = s.class_id
+           WHERE s.id = ?`
+        )
+        .bind(studentId)
+        .first();
+    }
     if (!student) return json({ error: "Student not found." }, 404);
 
     const restriction = adminLevelRestriction(sessionCtx);
@@ -4665,18 +4679,34 @@ async function handleResultsRoutes(request, env, url) {
       if (!cls || cls.level !== restriction) return json({ error: "Not authorised for this class." }, 403);
     }
 
-    const { results: rows } = await env.DB
-      .prepare(
-        `SELECT s.id AS student_id, s.name AS student_name, s.admission_no, s.gender,
-                r.status
-         FROM students s
-         LEFT JOIN results r
-           ON r.student_id = s.id AND r.class_id = ? AND r.term = ? AND r.session = ?
-         WHERE s.class_id = ? AND s.status = 'active'
-         ORDER BY s.name COLLATE NOCASE`
-      )
-      .bind(classId, term, session, classId)
-      .all();
+    let rows;
+    try {
+      ({ results: rows } = await env.DB
+        .prepare(
+          `SELECT s.id AS student_id, s.name AS student_name, s.admission_no, s.gender,
+                  r.status
+           FROM students s
+           LEFT JOIN results r
+             ON r.student_id = s.id AND r.class_id = ? AND r.term = ? AND r.session = ?
+           WHERE s.class_id = ? AND s.status = 'active'
+           ORDER BY s.name COLLATE NOCASE`
+        )
+        .bind(classId, term, session, classId)
+        .all());
+    } catch (e) {
+      ({ results: rows } = await env.DB
+        .prepare(
+          `SELECT s.id AS student_id, s.name AS student_name, s.admission_no,
+                  r.status
+           FROM students s
+           LEFT JOIN results r
+             ON r.student_id = s.id AND r.class_id = ? AND r.term = ? AND r.session = ?
+           WHERE s.class_id = ? AND s.status = 'active'
+           ORDER BY s.name COLLATE NOCASE`
+        )
+        .bind(classId, term, session, classId)
+        .all());
+    }
 
     const byStudent = {};
     for (const row of rows) {
@@ -5296,6 +5326,11 @@ async function handleSmsRoutes(request, env, url) {
  * student via the Roster tool's Edit form, PATCH /api/students/:id):
  *
  * ALTER TABLE students ADD COLUMN dob TEXT;
+ *
+ * One-time D1 migration to store each student's gender (Male / Female) —
+ * shown on report cards, ID cards, class lists and the student's own page:
+ *
+ * ALTER TABLE students ADD COLUMN gender TEXT;
  *
  * One-time D1 migration to add a next-class link to classes (needed for
  * the Promotion tool — set per class via PATCH /api/classes/:id, used to
