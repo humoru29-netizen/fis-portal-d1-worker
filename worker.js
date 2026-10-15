@@ -1546,6 +1546,86 @@ async function handleRosterRoutes(request, env, url) {
     return json({ message: "Student added.", id, admissionNo });
   }
 
+  // ---------------- PERMANENTLY DELETE WRONGLY-ENTERED STUDENTS ----------------
+  // "Remove student" only hides a pupil (status = inactive); the record and its
+  // admission number stay in the database. These two routes erase pupils completely,
+  // but ONLY pupils with no results, attendance, fees, remarks, submissions or CBT
+  // records, so real history can never be wiped by accident.
+  const studentHasHistory = async (studentId) => {
+    const tables = ["results", "attendance", "fee_transactions", "report_remarks", "assignment_submissions", "cbt_submissions"];
+    for (const t of tables) {
+      const r = await env.DB.prepare(`SELECT COUNT(*) AS count FROM ${t} WHERE student_id = ?`).bind(studentId).first();
+      if (r && r.count > 0) return t;
+    }
+    return null;
+  };
+  const eraseStudent = async (studentId) => {
+    await env.DB.prepare("DELETE FROM student_pins WHERE student_id = ?").bind(studentId).run();
+    await env.DB.prepare("DELETE FROM students WHERE id = ?").bind(studentId).run();
+  };
+
+  // One pupil: DELETE /api/students/:id/permanent
+  const permMatch = pathname.match(/^\/api\/students\/([^/]+)\/permanent$/);
+  if (permMatch && request.method === "DELETE") {
+    const sessionCtx = await getSession(request, env);
+    if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const studentId = permMatch[1];
+    const student = await env.DB.prepare("SELECT id, name, level FROM students WHERE id = ?").bind(studentId).first();
+    if (!student) return json({ error: "Student not found." }, 404);
+
+    const restriction = adminLevelRestriction(sessionCtx);
+    if (restriction && student.level !== restriction) {
+      return json({ error: "Not authorised for this student." }, 403);
+    }
+
+    const blocker = await studentHasHistory(studentId);
+    if (blocker) {
+      return json({ error: `Can't permanently delete ${student.name}: this pupil already has ${blocker.replace(/_/g, " ")} records. Use "Remove student" instead so the history is kept.` }, 409);
+    }
+
+    await eraseStudent(studentId);
+    return json({ message: `${student.name} was permanently deleted.` });
+  }
+
+  // Whole class by wrong session: POST /api/students/purge { classId, sessionJoined }
+  if (pathname === "/api/students/purge" && request.method === "POST") {
+    const sessionCtx = await getSession(request, env);
+    if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const { classId, sessionJoined } = await request.json();
+    if (!classId || !sessionJoined || !String(sessionJoined).trim()) {
+      return json({ error: "classId and sessionJoined are required." }, 400);
+    }
+
+    const cls = await env.DB.prepare("SELECT id, level FROM classes WHERE id = ?").bind(classId).first();
+    if (!cls) return json({ error: "Class not found." }, 404);
+    const restriction = adminLevelRestriction(sessionCtx);
+    if (restriction && cls.level !== restriction) {
+      return json({ error: "Not authorised for this class." }, 403);
+    }
+
+    const { results: rows } = await env.DB
+      .prepare("SELECT id, name FROM students WHERE class_id = ? AND TRIM(session_joined) = ?")
+      .bind(classId, String(sessionJoined).trim())
+      .all();
+    if (!rows.length) {
+      return json({ error: `No pupils in this class were entered with session "${String(sessionJoined).trim()}".` }, 404);
+    }
+
+    let deleted = 0;
+    const kept = [];
+    for (const s of rows) {
+      if (await studentHasHistory(s.id)) { kept.push(s.name); continue; }
+      await eraseStudent(s.id);
+      deleted++;
+    }
+
+    let message = `Permanently deleted ${deleted} pupil(s) entered with session ${String(sessionJoined).trim()}.`;
+    if (kept.length) message += ` ${kept.length} pupil(s) were kept because they already have results/attendance/fee records: ${kept.slice(0, 5).join(", ")}${kept.length > 5 ? " and more" : ""}.`;
+    return json({ message, deleted, kept: kept.length });
+  }
+
   // ---------------- STUDENT PHOTO: SAVE / CLEAR URL (photo file itself lives in Firebase Storage) ----------------
   const photoMatch = pathname.match(/^\/api\/students\/([^/]+)\/photo$/);
   if (photoMatch) {
@@ -4679,6 +4759,15 @@ async function describeAudit(env, method, path, body) {
     const c = s ? await auditClass(env, s.class_id) : null;
     return R("PINs", `Generated login PIN for student "${s ? s.name : "(unknown)"}" (${termSess(b.term, b.session)})`, "student", s && s.name, c ? `Class: ${c}` : null);
   }
+  if ((m = path.match(/^\/api\/students\/([^/]+)\/permanent$/)) && method === "DELETE") {
+    const full = await auditRow(env, "students", m[1], "name, admission_no, class_id");
+    const c = full ? await auditClass(env, full.class_id) : null;
+    return R("Roster", `Permanently deleted student "${full ? full.name : "(unknown)"}"${c ? " from " + c : ""}`, "student", full && full.name, full ? `Admission no: ${full.admission_no}` : null);
+  }
+  if (path === "/api/students/purge" && method === "POST") {
+    const c = await auditClass(env, b.classId);
+    return R("Roster", `Permanently deleted pupils of ${c || "a class"} entered with session ${b.sessionJoined || "?"}`, "class", c, `Session joined: ${b.sessionJoined || "?"}`);
+  }
   if ((m = path.match(/^\/api\/students\/([^/]+)$/))) {
     const full = await auditRow(env, "students", m[1], "name, admission_no, class_id, guardian_name, guardian_phone, gender, session_joined, dob");
     const c = full ? await auditClass(env, full.class_id) : null;
@@ -4820,6 +4909,10 @@ async function describeAudit(env, method, path, body) {
     const c = await auditClass(env, b.classId);
     const verb = path.includes("approve") ? "Approved" : path.includes("release") ? "Released" : "Withheld";
     return R("Results", `${verb} all results of ${c || "a class"}`, "class", c, termSess(b.term, b.session));
+  }
+  if (path === "/api/results/delete-class" && method === "POST") {
+    const c = await auditClass(env, b.classId);
+    return R("Results", `Deleted ALL results of ${c || "a class"}`, "class", c, termSess(b.term, b.session));
   }
   if ((m = path.match(/^\/api\/results\/([^/]+)$/)) && method === "PATCH") {
     const r = await auditRow(env, "results", m[1], "student_id, subject_id, class_id, term, session");
@@ -5362,6 +5455,41 @@ async function handleResultsRoutes(request, env, url) {
       .run();
 
     return json({ message: "All results withheld for this class/term/session." });
+  }
+
+  // ---------------- DELETE ALL RESULTS FOR A CLASS/TERM/SESSION ----------------
+  // For fixing results entered under the wrong session/year. Only removes the
+  // rows matching this exact class + term + session; other sessions are untouched.
+  if (pathname === "/api/results/delete-class" && request.method === "POST") {
+    const sessionCtx = await getSession(request, env);
+    if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const { classId, term, session } = await request.json();
+    if (!classId || !term || !session) {
+      return json({ error: "classId, term, and session are required." }, 400);
+    }
+
+    const restriction = adminLevelRestriction(sessionCtx);
+    if (restriction) {
+      const cls = await env.DB.prepare("SELECT level FROM classes WHERE id = ?").bind(classId).first();
+      if (!cls || cls.level !== restriction) return json({ error: "Not authorised for this class." }, 403);
+    }
+
+    const countRow = await env.DB
+      .prepare("SELECT COUNT(*) AS count FROM results WHERE class_id = ? AND term = ? AND session = ?")
+      .bind(classId, term, session)
+      .first();
+    const count = (countRow && countRow.count) || 0;
+    if (!count) {
+      return json({ error: "No results found for this class/term/session." }, 404);
+    }
+
+    await env.DB
+      .prepare("DELETE FROM results WHERE class_id = ? AND term = ? AND session = ?")
+      .bind(classId, term, session)
+      .run();
+
+    return json({ message: `Deleted ${count} result record(s) for this class/term/session.`, deleted: count });
   }
 
   // ---------------- RELEASE / WITHHOLD ALL RESULTS FOR SELECTED STUDENTS ----------------
