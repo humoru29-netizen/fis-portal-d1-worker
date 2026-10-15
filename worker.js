@@ -4485,47 +4485,505 @@ async function handleBirthdayRoutes(request, env, url) {
 // SECTION 7B5: Audit trail (who changed what, and when)
 // =====================================================================
 /**
- * Every successful change (POST / PATCH / DELETE) made by a logged-in
- * staff member is recorded automatically by the router below — request
- * bodies are never stored, so passwords and PINs can't leak into it.
+ * Every successful change (POST / PATCH / PUT / DELETE) made by a logged-in
+ * staff member is recorded automatically by the router below, with:
+ *   WHEN  - exact date and time (stored in UTC, shown in Nigeria time)
+ *   WHO   - staff name, role and level
+ *   WHAT  - a plain-English sentence, e.g. Deleted class "JSS 1 A" (Secondary)
+ *   WHERE - the section of the portal, the class/level affected, plus the
+ *           network location (IP, town) and device the change came from
  *
- * One-time D1 migration:
+ * Request bodies are never stored as-is. Only whitelisted, non-secret facts
+ * (names, classes, terms, scores, amounts) go into the sentence, so passwords,
+ * PINs and phone numbers can't leak into the log.
+ *
+ * One-time D1 migration (run these 3 statements one at a time in the D1
+ * Console. Do it BEFORE deploying this worker.js):
+ *
+ * DROP TABLE audit_log;
  *
  * CREATE TABLE audit_log (
  *   id TEXT PRIMARY KEY,
  *   actor_id TEXT,
  *   actor_name TEXT,
  *   actor_role TEXT,
+ *   actor_level TEXT,
  *   method TEXT NOT NULL,
  *   path TEXT NOT NULL,
  *   status INTEGER,
+ *   summary TEXT,
+ *   section TEXT,
+ *   target_type TEXT,
+ *   target_name TEXT,
+ *   detail TEXT,
+ *   ip TEXT,
+ *   location TEXT,
+ *   device TEXT,
  *   created_at TEXT NOT NULL
  * );
+ *
  * CREATE INDEX idx_audit_created ON audit_log(created_at);
  *
  * Route:
  *   GET /api/audit?limit=  (auth: general_admin) newest first, max 500
+ *   Each entry includes a ready-made "when" string in Nigeria time.
  */
-const AUDIT_SKIP_PATHS = ["/api/login", "/api/student-login", "/api/refresh", "/api/signup", "/api/admissions/apply", "/api/audit"];
+const AUDIT_SKIP_PATHS = ["/api/login", "/api/student-login", "/api/refresh", "/api/signup", "/api/admissions/apply", "/api/audit", "/api/scan-roster"];
 
-async function recordAudit(request, env, url, response) {
+function auditCap(s, n) {
+  const t = String(s == null ? "" : s);
+  const max = n || 220;
+  return t.length > max ? t.slice(0, max - 1) + "…" : t;
+}
+function auditCase(s) {
+  const t = String(s || "");
+  return t ? t.charAt(0).toUpperCase() + t.slice(1) : "";
+}
+function auditNaira(n) {
+  return "₦" + Number(n || 0).toLocaleString("en-NG");
+}
+
+async function auditRow(env, table, id, cols) {
+  if (!id) return null;
   try {
-    if (!["POST", "PATCH", "DELETE"].includes(request.method)) return;
-    if (response.status >= 400) return;
-    if (url.pathname.startsWith("/api/public/") || AUDIT_SKIP_PATHS.includes(url.pathname)) return;
+    return await env.DB.prepare(`SELECT ${cols} FROM ${table} WHERE id = ?`).bind(id).first();
+  } catch (_) {
+    return null;
+  }
+}
+async function auditClass(env, id) {
+  const r = await auditRow(env, "classes", id, "name, level");
+  return r ? `${r.name} (${auditCase(r.level)})` : null;
+}
+async function auditSubject(env, id) {
+  const r = await auditRow(env, "subjects", id, "name");
+  return r ? r.name : null;
+}
+async function auditStaff(env, id) {
+  const r = await auditRow(env, "users", id, "name, role");
+  return r ? r.name : null;
+}
+async function auditStudent(env, id) {
+  const r = await auditRow(env, "students", id, "name, admission_no, class_id");
+  return r || null;
+}
+async function auditStudentNames(env, ids, limit) {
+  const list = (Array.isArray(ids) ? ids : []).filter((x) => typeof x === "string").slice(0, limit || 10);
+  if (!list.length) return "";
+  try {
+    const marks = list.map(() => "?").join(",");
+    const { results } = await env.DB.prepare(`SELECT name FROM students WHERE id IN (${marks})`).bind(...list).all();
+    return (results || []).map((r) => r.name).join(", ");
+  } catch (_) {
+    return "";
+  }
+}
+
+function auditDevice(ua) {
+  const s = String(ua || "");
+  if (!s) return null;
+  let os = "Unknown device";
+  let model = "";
+  let m;
+  if ((m = s.match(/Android [\d.]+; ([^;)]+)/))) {
+    os = "Android phone";
+    model = m[1].trim();
+  } else if (/Android/i.test(s)) os = "Android phone";
+  else if (/iPhone/i.test(s)) os = "iPhone";
+  else if (/iPad/i.test(s)) os = "iPad";
+  else if (/Windows/i.test(s)) os = "Windows PC";
+  else if (/Macintosh|Mac OS X/i.test(s)) os = "Mac";
+  else if (/Linux/i.test(s)) os = "Linux";
+  let browser = "browser";
+  if (/Edg\//.test(s)) browser = "Edge";
+  else if (/OPR\/|Opera/.test(s)) browser = "Opera";
+  else if (/Firefox\//.test(s)) browser = "Firefox";
+  else if (/Chrome\//.test(s)) browser = "Chrome";
+  else if (/Safari\//.test(s)) browser = "Safari";
+  return auditCap(`${os}${model ? " (" + model + ")" : ""} · ${browser}`, 120);
+}
+function auditPlace(request) {
+  const cf = request.cf || {};
+  const parts = [cf.city, cf.region, cf.country].filter(Boolean);
+  return parts.length ? parts.join(", ") : null;
+}
+
+// Plain-English description of one request. Runs BEFORE the real handler, so
+// records that are about to be deleted can still be looked up by name.
+async function describeAudit(env, method, path, body) {
+  const b = body && typeof body === "object" ? body : {};
+  let m;
+  const R = (section, summary, targetType, targetName, detail) => ({
+    section,
+    summary: auditCap(summary),
+    targetType: targetType || null,
+    targetName: targetName ? auditCap(targetName, 120) : null,
+    detail: detail ? auditCap(detail, 400) : null
+  });
+  const termSess = (t, s) => [t, s].filter(Boolean).join(" ");
+
+  // ---------------- Classes & subjects ----------------
+  if (path === "/api/classes" && method === "POST") {
+    return R("Classes & Subjects", `Created class "${b.name}" (${auditCase(b.level)})`, "class", b.name, `Level: ${auditCase(b.level)}`);
+  }
+  if ((m = path.match(/^\/api\/classes\/([^/]+)\/subjects$/)) && method === "POST") {
+    const [c, s] = await Promise.all([auditClass(env, m[1]), auditSubject(env, b.subjectId)]);
+    return R("Classes & Subjects", `Added subject "${s || "?"}" to class ${c || "?"}`, "class subject", `${s || "?"} – ${c || "?"}`, null);
+  }
+  if ((m = path.match(/^\/api\/classes\/([^/]+)\/subjects\/([^/]+)$/)) && method === "DELETE") {
+    const [c, s] = await Promise.all([auditClass(env, m[1]), auditSubject(env, m[2])]);
+    return R("Classes & Subjects", `Removed subject "${s || "?"}" from class ${c || "?"}`, "class subject", `${s || "?"} – ${c || "?"}`, null);
+  }
+  if ((m = path.match(/^\/api\/classes\/([^/]+)\/promote$/)) && method === "POST") {
+    const from = await auditClass(env, m[1]);
+    const to = b.toClassId ? await auditClass(env, b.toClassId) : null;
+    const n = Array.isArray(b.studentIds) ? b.studentIds.length : 0;
+    const names = await auditStudentNames(env, b.studentIds, 10);
+    const more = n > 10 ? ` and ${n - 10} more` : "";
+    return R(
+      "Roster",
+      to ? `Promoted ${n} student(s) from ${from} to ${to}` : `Graduated ${n} student(s) from ${from}`,
+      "class",
+      from,
+      names ? `Students: ${names}${more}` : null
+    );
+  }
+  if ((m = path.match(/^\/api\/classes\/([^/]+)$/))) {
+    const c = await auditClass(env, m[1]);
+    if (method === "DELETE") return R("Classes & Subjects", `Deleted class ${c || "(unknown)"}`, "class", c, null);
+    if (method === "PATCH") {
+      const nxt = b.nextClassId ? await auditClass(env, b.nextClassId) : null;
+      const detail = b.nextClassId !== undefined ? (nxt ? `Promotes to: ${nxt}` : "Promotion target cleared") : null;
+      return R("Classes & Subjects", `Updated class ${c || "(unknown)"}`, "class", c, detail);
+    }
+  }
+  if (path === "/api/subjects" && method === "POST") {
+    return R("Classes & Subjects", `Created subject "${b.name}" (${auditCase(b.level)})`, "subject", b.name, `Level: ${auditCase(b.level)}`);
+  }
+  if ((m = path.match(/^\/api\/subjects\/([^/]+)$/)) && method === "DELETE") {
+    const s = await auditSubject(env, m[1]);
+    return R("Classes & Subjects", `Deleted subject "${s || "(unknown)"}"`, "subject", s, null);
+  }
+
+  // ---------------- Students ----------------
+  if (path === "/api/students" && method === "POST") {
+    const c = await auditClass(env, b.classId);
+    const bits = [`Class: ${c || "?"}`];
+    if (b.sessionJoined) bits.push(`Session joined: ${b.sessionJoined}`);
+    if (b.gender) bits.push(`Gender: ${b.gender}`);
+    return R("Roster", `Added student "${b.name}" to ${c || "a class"}`, "student", b.name, bits.join(" · "));
+  }
+  if ((m = path.match(/^\/api\/students\/([^/]+)\/photo$/))) {
+    const s = await auditStudent(env, m[1]);
+    const verb = method === "DELETE" ? "Removed photo of" : "Updated photo of";
+    return R("Roster", `${verb} student "${s ? s.name : "(unknown)"}"`, "student", s && s.name, s ? `Admission no: ${s.admission_no}` : null);
+  }
+  if ((m = path.match(/^\/api\/students\/([^/]+)\/pin$/)) && method === "POST") {
+    const s = await auditStudent(env, m[1]);
+    const c = s ? await auditClass(env, s.class_id) : null;
+    return R("PINs", `Generated login PIN for student "${s ? s.name : "(unknown)"}" (${termSess(b.term, b.session)})`, "student", s && s.name, c ? `Class: ${c}` : null);
+  }
+  if ((m = path.match(/^\/api\/students\/([^/]+)$/))) {
+    const full = await auditRow(env, "students", m[1], "name, admission_no, class_id, guardian_name, guardian_phone, gender, session_joined, dob");
+    const c = full ? await auditClass(env, full.class_id) : null;
+    if (method === "DELETE") {
+      return R("Roster", `Removed student "${full ? full.name : "(unknown)"}"${c ? " from " + c : ""}`, "student", full && full.name, full ? `Admission no: ${full.admission_no}` : null);
+    }
+    if (method === "PATCH") {
+      const changes = [];
+      if (full) {
+        if (b.name !== undefined && b.name !== full.name) changes.push(`Name: ${full.name} → ${b.name}`);
+        if (b.classId !== undefined && b.classId !== full.class_id) {
+          const nc = await auditClass(env, b.classId);
+          changes.push(`Class: ${c || "?"} → ${nc || "?"}`);
+        }
+        if (b.gender !== undefined && (b.gender || "") !== (full.gender || "")) changes.push(`Gender: ${full.gender || "blank"} → ${b.gender || "blank"}`);
+        if (b.dob !== undefined && (b.dob || "") !== (full.dob || "")) changes.push(`Date of birth: ${full.dob || "blank"} → ${b.dob || "blank"}`);
+        if (b.sessionJoined !== undefined && (b.sessionJoined || "") !== (full.session_joined || "")) changes.push(`Session joined: ${full.session_joined || "blank"} → ${b.sessionJoined || "blank"}`);
+        if (b.guardianName !== undefined && (b.guardianName || "") !== (full.guardian_name || "")) changes.push(`Guardian name: ${full.guardian_name || "blank"} → ${b.guardianName || "blank"}`);
+        if (b.guardianPhone !== undefined && (b.guardianPhone || "") !== (full.guardian_phone || "")) changes.push("Guardian phone number changed");
+      }
+      return R(
+        "Roster",
+        `Edited student "${full ? full.name : "(unknown)"}"${c ? " (" + c + ")" : ""}`,
+        "student",
+        full && full.name,
+        changes.length ? changes.join(" · ") : "No visible field changes"
+      );
+    }
+  }
+
+  // ---------------- Teacher assignments, timetable, attendance ----------------
+  if (path === "/api/teacher-assignments" && method === "POST") {
+    const [t, c, s] = await Promise.all([auditStaff(env, b.teacherId), auditClass(env, b.classId), auditSubject(env, b.subjectId)]);
+    return R("Teachers", `Assigned ${t || "teacher"} to teach ${s || "?"} in ${c || "?"}`, "teacher assignment", t, `Class: ${c || "?"} · Subject: ${s || "?"}`);
+  }
+  if ((m = path.match(/^\/api\/teacher-assignments\/([^/]+)$/)) && method === "DELETE") {
+    const a = await auditRow(env, "teacher_assignments", m[1], "teacher_id, class_id, subject_id");
+    const [t, c, s] = a ? await Promise.all([auditStaff(env, a.teacher_id), auditClass(env, a.class_id), auditSubject(env, a.subject_id)]) : [null, null, null];
+    return R("Teachers", `Removed ${t || "a teacher"} from ${s || "?"} in ${c || "?"}`, "teacher assignment", t, `Class: ${c || "?"} · Subject: ${s || "?"}`);
+  }
+  if (path === "/api/timetable" && method === "POST") {
+    const [t, c, s] = await Promise.all([auditStaff(env, b.teacherId), auditClass(env, b.classId), auditSubject(env, b.subjectId)]);
+    return R("Timetable", `Added timetable slot: ${s || "?"} for ${c || "?"} on ${b.dayOfWeek || "?"} ${b.startTime || ""}-${b.endTime || ""}`, "timetable slot", `${s || "?"} – ${c || "?"}`, `Teacher: ${t || "?"}`);
+  }
+  if ((m = path.match(/^\/api\/timetable\/([^/]+)$/)) && method === "DELETE") {
+    const slot = await auditRow(env, "timetable_slots", m[1], "class_id, subject_id, teacher_id, day_of_week, start_time, end_time");
+    const [c, s] = slot ? await Promise.all([auditClass(env, slot.class_id), auditSubject(env, slot.subject_id)]) : [null, null];
+    return R("Timetable", `Removed timetable slot: ${s || "?"} for ${c || "?"}${slot ? " on " + slot.day_of_week + " " + slot.start_time : ""}`, "timetable slot", `${s || "?"} – ${c || "?"}`, null);
+  }
+  if (path === "/api/attendance" && method === "POST") {
+    const c = await auditClass(env, b.classId);
+    const n = Array.isArray(b.records) ? b.records.length : 0;
+    return R("Attendance", `Marked attendance for ${c || "a class"} on ${b.date || "?"} (${n} students)`, "class", c, termSess(b.term, b.session));
+  }
+
+  // ---------------- Assignments ----------------
+  if (path === "/api/assignments" && method === "POST") {
+    const [c, s] = await Promise.all([auditClass(env, b.classId), auditSubject(env, b.subjectId)]);
+    return R("Assignments", `Posted assignment "${b.title}" for ${c || "?"}`, "assignment", b.title, `Subject: ${s || "?"}${b.dueDate ? " · Due: " + b.dueDate : ""}`);
+  }
+  if ((m = path.match(/^\/api\/assignments\/([^/]+)\/submissions\/([^/]+)$/)) && method === "PATCH") {
+    const a = await auditRow(env, "assignments", m[1], "title");
+    return R("Assignments", `Graded a submission for assignment "${a ? a.title : "(unknown)"}"`, "assignment", a && a.title, null);
+  }
+  if ((m = path.match(/^\/api\/assignments\/([^/]+)$/)) && method === "DELETE") {
+    const a = await auditRow(env, "assignments", m[1], "title");
+    return R("Assignments", `Deleted assignment "${a ? a.title : "(unknown)"}"`, "assignment", a && a.title, null);
+  }
+
+  // ---------------- Admissions & account approvals ----------------
+  if ((m = path.match(/^\/api\/admissions\/([^/]+)$/)) && method === "PATCH") {
+    const a = await auditRow(env, "admission_applications", m[1], "student_name, class_applied, level_applied");
+    const c = b.classId ? await auditClass(env, b.classId) : null;
+    const verb = b.action === "approve" ? "Approved" : b.action === "reject" ? "Rejected" : "Updated";
+    return R("Admissions", `${verb} admission application of "${a ? a.student_name : "(unknown)"}"`, "applicant", a && a.student_name, b.action === "approve" ? `Placed in: ${c || "?"}` : `Applied for: ${a ? a.class_applied || a.level_applied || "?" : "?"}`);
+  }
+  if ((m = path.match(/^\/api\/approvals\/([^/]+)$/)) && method === "POST") {
+    const u = await auditStaff(env, m[1]);
+    const verb = b.action === "approve" ? "Approved" : "Rejected";
+    return R("Manage Accounts", `${verb} staff account request of "${u || "(unknown)"}"`, "staff", u, b.action === "approve" ? `Role: ${b.role || "?"}${b.level ? " · Level: " + b.level : ""}` : null);
+  }
+
+  // ---------------- Staff accounts ----------------
+  if ((m = path.match(/^\/api\/staff\/([^/]+)\/(phone|dob|status|reset-password)$/))) {
+    const u = await auditStaff(env, m[1]);
+    const what = m[2];
+    if (what === "phone") return R("Manage Accounts", `Updated phone number of staff "${u || "(unknown)"}"`, "staff", u, null);
+    if (what === "dob") return R("Manage Accounts", `Updated date of birth of staff "${u || "(unknown)"}"`, "staff", u, null);
+    if (what === "status") return R("Manage Accounts", `Changed account status of staff "${u || "(unknown)"}" to ${b.status || "?"}`, "staff", u, null);
+    return R("Manage Accounts", `Reset password of staff "${u || "(unknown)"}"`, "staff", u, null);
+  }
+  if ((m = path.match(/^\/api\/staff\/([^/]+)$/))) {
+    const row = await auditRow(env, "users", m[1], "name, role, level");
+    if (method === "DELETE") return R("Manage Accounts", `Deleted staff account "${row ? row.name : "(unknown)"}"`, "staff", row && row.name, row ? `Role was: ${row.role}${row.level ? " · Level: " + row.level : ""}` : null);
+    if (method === "PATCH") {
+      return R(
+        "Manage Accounts",
+        `Changed role of staff "${row ? row.name : "(unknown)"}"`,
+        "staff",
+        row && row.name,
+        `${row ? row.role + (row.level ? "/" + row.level : "") : "?"} → ${b.role || "?"}${b.level ? "/" + b.level : ""}`
+      );
+    }
+  }
+
+  // ---------------- Fees ----------------
+  if (path === "/api/fee-structures" && method === "POST") {
+    const c = await auditClass(env, b.classId);
+    return R("Fees", `Set school fee for ${c || "a class"} to ${auditNaira(b.amount)}`, "fee structure", c, termSess(b.term, b.session));
+  }
+  if (path === "/api/fees/payments" && method === "POST") {
+    const s = await auditStudent(env, b.studentId);
+    const c = s ? await auditClass(env, s.class_id) : null;
+    return R("Fees", `Recorded ${auditNaira(b.amount)} ${b.type || "payment"} for "${s ? s.name : "(unknown)"}"`, "student", s && s.name, `${termSess(b.term, b.session)}${c ? " · Class: " + c : ""}${s ? " · Adm no: " + s.admission_no : ""}`);
+  }
+  if ((m = path.match(/^\/api\/fees\/payments\/([^/]+)$/)) && method === "PATCH") {
+    const tx = await auditRow(env, "fee_transactions", m[1], "student_id, amount, type");
+    const s = tx ? await auditStudent(env, tx.student_id) : null;
+    const verb = b.void === true ? "Voided" : "Corrected";
+    return R("Fees", `${verb} ${tx ? auditNaira(tx.amount) : ""} payment of "${s ? s.name : "(unknown)"}"`, "student", s && s.name, `Reason: ${b.reason || "none given"}`);
+  }
+  if ((m = path.match(/^\/api\/report-remarks\/([^/]+)$/)) && method === "PUT") {
+    const s = await auditStudent(env, m[1]);
+    return R("Report Cards", `Saved report-card remark for "${s ? s.name : "(unknown)"}"`, "student", s && s.name, termSess(b.term, b.session));
+  }
+
+  // ---------------- Results ----------------
+  if (path === "/api/results" && method === "POST") {
+    const [s, subj, c] = await Promise.all([auditStudent(env, b.studentId), auditSubject(env, b.subjectId), auditClass(env, b.classId)]);
+    return R("Results", `Entered scores for "${s ? s.name : "(unknown)"}" in ${subj || "?"}`, "student", s && s.name, `${c || "?"} · ${termSess(b.term, b.session)} · CA1 ${b.ca1 ?? "-"}, CA2 ${b.ca2 ?? "-"}, Exam ${b.exam ?? "-"}`);
+  }
+  if ((m = path.match(/^\/api\/results\/(release|withhold)-students$/)) && method === "POST") {
+    const c = await auditClass(env, b.classId);
+    const n = Array.isArray(b.studentIds) ? b.studentIds.length : 0;
+    const names = await auditStudentNames(env, b.studentIds, 8);
+    return R("Results", `${m[1] === "release" ? "Released" : "Withheld"} results of ${n} student(s) in ${c || "a class"}`, "class", c, `${termSess(b.term, b.session)}${names ? " · " + names + (n > 8 ? " and more" : "") : ""}`);
+  }
+  if (["/api/results/approve-class", "/api/results/release-class", "/api/results/withhold-class"].includes(path) && method === "POST") {
+    const c = await auditClass(env, b.classId);
+    const verb = path.includes("approve") ? "Approved" : path.includes("release") ? "Released" : "Withheld";
+    return R("Results", `${verb} all results of ${c || "a class"}`, "class", c, termSess(b.term, b.session));
+  }
+  if ((m = path.match(/^\/api\/results\/([^/]+)$/)) && method === "PATCH") {
+    const r = await auditRow(env, "results", m[1], "student_id, subject_id, class_id, term, session");
+    const [s, subj] = r ? await Promise.all([auditStudent(env, r.student_id), auditSubject(env, r.subject_id)]) : [null, null];
+    return R("Results", `Changed result status to "${b.status || "?"}" for "${s ? s.name : "(unknown)"}" in ${subj || "?"}`, "student", s && s.name, r ? termSess(r.term, r.session) : null);
+  }
+
+  // ---------------- CBT ----------------
+  if (path === "/api/cbt/tests" && method === "POST") {
+    const [c, s] = await Promise.all([auditClass(env, b.classId), auditSubject(env, b.subjectId)]);
+    return R("CBT", `Created CBT test "${b.title}" for ${c || "?"}`, "cbt test", b.title, `Subject: ${s || "?"} · ${termSess(b.term, b.session)}`);
+  }
+  if ((m = path.match(/^\/api\/cbt\/tests\/([^/]+)\/questions\/from-bank$/)) && method === "POST") {
+    const t = await auditRow(env, "cbt_tests", m[1], "title");
+    return R("CBT", `Added questions from the question bank to test "${t ? t.title : "(unknown)"}"`, "cbt test", t && t.title, null);
+  }
+  if ((m = path.match(/^\/api\/cbt\/tests\/([^/]+)\/questions\/([^/]+)$/)) && method === "DELETE") {
+    const t = await auditRow(env, "cbt_tests", m[1], "title");
+    return R("CBT", `Deleted a question from test "${t ? t.title : "(unknown)"}"`, "cbt test", t && t.title, null);
+  }
+  if ((m = path.match(/^\/api\/cbt\/tests\/([^/]+)\/questions$/)) && method === "POST") {
+    const t = await auditRow(env, "cbt_tests", m[1], "title");
+    return R("CBT", `Added a question to test "${t ? t.title : "(unknown)"}"`, "cbt test", t && t.title, null);
+  }
+  if ((m = path.match(/^\/api\/cbt\/tests\/([^/]+)$/))) {
+    const t = await auditRow(env, "cbt_tests", m[1], "title");
+    if (method === "DELETE") return R("CBT", `Deleted CBT test "${t ? t.title : "(unknown)"}"`, "cbt test", t && t.title, null);
+    if (method === "PATCH") return R("CBT", `Updated CBT test "${t ? t.title : "(unknown)"}"`, "cbt test", t && t.title, b.status ? `Status: ${b.status}` : null);
+  }
+  if (path === "/api/cbt/question-bank" && method === "POST") {
+    const [c, s] = await Promise.all([auditClass(env, b.classId), auditSubject(env, b.subjectId)]);
+    return R("CBT", `Added a question to the question bank (${s || "?"}, ${c || "?"})`, "question bank", null, null);
+  }
+  if ((m = path.match(/^\/api\/cbt\/question-bank\/([^/]+)$/)) && method === "DELETE") {
+    return R("CBT", "Deleted a question from the question bank", "question bank", null, null);
+  }
+
+  // ---------------- Announcements, site content, gallery, birthdays ----------------
+  if (path === "/api/announcements" && method === "POST") {
+    return R("Announcements", `Posted announcement "${b.title}"`, "announcement", b.title, b.audience ? `Audience: ${b.audience}` : null);
+  }
+  if ((m = path.match(/^\/api\/announcements\/([^/]+)$/)) && method === "DELETE") {
+    const a = await auditRow(env, "announcements", m[1], "title");
+    return R("Announcements", `Deleted announcement "${a ? a.title : "(unknown)"}"`, "announcement", a && a.title, null);
+  }
+  if (path === "/api/settings/about" && method === "PUT") return R("Site Content", "Edited the About Us text", "site content", "About Us", null);
+  if (path === "/api/settings/contact" && method === "PUT") return R("Site Content", "Edited the Contact details", "site content", "Contact", null);
+  if (path === "/api/leadership" && method === "POST") return R("Site Content", `Added leadership entry "${b.name}"`, "leadership", b.name, b.title ? `Title: ${b.title}` : null);
+  if ((m = path.match(/^\/api\/leadership\/([^/]+)$/))) {
+    const l = await auditRow(env, "leadership", m[1], "name, title");
+    return R("Site Content", `${method === "DELETE" ? "Deleted" : "Edited"} leadership entry "${l ? l.name : "(unknown)"}"`, "leadership", l && l.name, l && l.title ? `Title: ${l.title}` : null);
+  }
+  if (path === "/api/gallery" && method === "POST") return R("Gallery", `Added gallery item "${b.title || b.itemType || "item"}"`, "gallery item", b.title, b.itemType ? `Type: ${b.itemType}` : null);
+  if ((m = path.match(/^\/api\/gallery\/([^/]+)$/)) && method === "DELETE") {
+    const g = await auditRow(env, "gallery", m[1], "title");
+    return R("Gallery", `Deleted gallery item "${g ? g.title : "(unknown)"}"`, "gallery item", g && g.title, null);
+  }
+  if (path === "/api/birthday-wishes" && method === "POST") return R("Birthdays", `Created birthday wish for "${b.name}"`, b.personType || "person", b.name, null);
+  if ((m = path.match(/^\/api\/birthday-wishes\/([^/]+)$/))) {
+    const w = await auditRow(env, "birthday_wishes", m[1], "name");
+    if (method === "DELETE") return R("Birthdays", `Deleted birthday wish for "${w ? w.name : "(unknown)"}"`, "person", w && w.name, null);
+    if (method === "PATCH") return R("Birthdays", `Updated birthday wish for "${w ? w.name : "(unknown)"}"`, "person", w && w.name, b.status ? `Status: ${b.status}` : null);
+  }
+  if (path === "/api/sms/notify-birthdays" && method === "POST") return R("Messaging", "Sent birthday SMS messages", "sms", null, null);
+
+  // ---------------- SMS ----------------
+  if (path === "/api/sms/notify-results" && method === "POST") {
+    const c = await auditClass(env, b.classId);
+    return R("Messaging", `Sent results SMS to parents of ${c || "a class"}`, "class", c, termSess(b.term, b.session));
+  }
+  if (path === "/api/sms/notify-fees" && method === "POST") {
+    const c = await auditClass(env, b.classId);
+    return R("Messaging", `Sent fee-reminder SMS to parents of ${c || "a class"}`, "class", c, termSess(b.term, b.session));
+  }
+  if (path === "/api/sms/notify-teachers" && method === "POST") {
+    const n = Array.isArray(b.teacherIds) ? b.teacherIds.length : 0;
+    return R("Messaging", `Sent SMS to ${n || "selected"} teacher(s)`, "sms", null, null);
+  }
+  if (path === "/api/sms/broadcast" && method === "POST") return R("Messaging", "Sent a broadcast SMS", "sms", null, null);
+
+  // ---------------- Fallback ----------------
+  const verbs = { POST: "Added or ran", PATCH: "Changed", PUT: "Saved", DELETE: "Deleted" };
+  const resource = path.replace(/^\/api\//, "").split("/")[0] || "item";
+  return R(auditCase(resource.replace(/-/g, " ")), `${verbs[method] || method}: ${resource}`, resource, null, path);
+}
+
+// Runs BEFORE the real handler so deleted records can still be named.
+async function captureAudit(request, env, url) {
+  try {
+    if (!["POST", "PATCH", "PUT", "DELETE"].includes(request.method)) return null;
+    if (url.pathname.startsWith("/api/public/") || AUDIT_SKIP_PATHS.includes(url.pathname)) return null;
 
     const session = await getSession(request, env);
-    if (!session || session.type !== "staff") return;
+    if (!session || session.type !== "staff") return null;
 
+    let body = null;
+    const ct = request.headers.get("Content-Type") || "";
+    const len = Number(request.headers.get("Content-Length") || 0);
+    if (ct.includes("json") && len < 200000) {
+      try {
+        body = await request.clone().json();
+      } catch (_) {
+        body = null;
+      }
+    }
+
+    const d = await describeAudit(env, request.method, url.pathname, body);
+    return {
+      session,
+      d,
+      ip: request.headers.get("CF-Connecting-IP") || null,
+      place: auditPlace(request),
+      device: auditDevice(request.headers.get("User-Agent"))
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
+async function recordAudit(request, env, url, response, ctx) {
+  try {
+    if (!ctx || response.status >= 400) return;
+    const { session, d } = ctx;
     await env.DB
       .prepare(
-        `INSERT INTO audit_log (id, actor_id, actor_name, actor_role, method, path, status, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))`
+        `INSERT INTO audit_log
+           (id, actor_id, actor_name, actor_role, actor_level, method, path, status,
+            summary, section, target_type, target_name, detail, ip, location, device, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))`
       )
-      .bind(uuid(), session.id, session.record.name || null, session.role || null, request.method, url.pathname, response.status)
+      .bind(
+        uuid(), session.id, session.record.name || null, session.role || null, session.level || null,
+        request.method, url.pathname, response.status,
+        d.summary, d.section, d.targetType, d.targetName, d.detail,
+        ctx.ip, ctx.place, ctx.device
+      )
       .run();
   } catch (err) {
     // Auditing must never break the request it is recording.
+  }
+}
+
+function auditWhen(createdAt) {
+  try {
+    const d = new Date(String(createdAt).replace(" ", "T") + "Z");
+    return (
+      new Intl.DateTimeFormat("en-GB", {
+        timeZone: "Africa/Lagos",
+        weekday: "short",
+        day: "2-digit",
+        month: "short",
+        year: "numeric",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hour12: false
+      }).format(d) + " WAT"
+    );
+  } catch (_) {
+    return String(createdAt || "");
   }
 }
 
@@ -4540,9 +4998,10 @@ async function handleAuditRoutes(request, env, url) {
         .prepare("SELECT * FROM audit_log ORDER BY created_at DESC LIMIT ?")
         .bind(limit)
         .all();
-      return json({ entries: results });
+      const entries = (results || []).map((r) => ({ ...r, when: auditWhen(r.created_at) }));
+      return json({ entries });
     } catch (err) {
-      return json({ error: "audit_log table not found — run the migration first.", detail: String((err && err.message) || err) }, 500);
+      return json({ error: "audit_log table not found or out of date — run the migration first.", detail: String((err && err.message) || err) }, 500);
     }
   }
   return null;
@@ -5550,10 +6009,12 @@ export default {
     const url = new URL(request.url);
 
     try {
+      // Work out WHO/WHAT/WHERE before the handler runs (so deletes can still be named)
+      const auditCtx = await captureAudit(request, env, url);
       for (const handler of modules) {
         const response = await handler(request, env, url);
         if (response) {
-          await recordAudit(request, env, url, response);
+          await recordAudit(request, env, url, response, auditCtx);
           const merged = new Headers(response.headers);
           for (const [k, v] of Object.entries(corsHeaders())) merged.set(k, v);
           return new Response(response.body, { status: response.status, headers: merged });
