@@ -1382,23 +1382,20 @@ async function handleAssignmentRoutes(request, env, url) {
 
 /**
  * Works out which admission-number series a student belongs to:
- *   secondary -> FISS/<admission year>/<4-digit sequence>   e.g. FISS/2024/0001
- *                (each admission year counts on its own, taken from the student's Session Joined)
- *   nursery   -> FIS/N/<4-digit sequence>         e.g. FIS/N/0001
- *   primary   -> FIS/P/<4-digit sequence>         e.g. FIS/P/0001
- * Nursery is not a separate level in the database (those classes are stored
- * under level "primary"), so it is recognised by the class name.
+ *   secondary          -> FISS/<admission year>/<4-digit sequence>   e.g. FISS/2024/0001
+ *   nursery + primary  -> FISP/<admission year>/<4-digit sequence>   e.g. FISP/2026/0001
+ * The year is taken from the student's Session Joined, and each year counts on its
+ * own. Nursery is not a separate level in the database (those classes are stored
+ * under level "primary"), so nursery and primary share the one FISP series.
  */
 function admissionSection(level, className) {
-  if (level === "secondary") return "secondary";
-  if (/nursery|cr[eè]che|kindergarten|\bkg\b|pre-?school|play-?group|reception/i.test(className || "")) return "nursery";
-  return "primary";
+  return level === "secondary" ? "secondary" : "primary";
 }
 
 /**
  * Generates the next admission number for the student's own series.
- * Each series counts separately, so primary and nursery start from 0001
- * and no longer continue from where secondary stopped.
+ * Each series and year counts separately, so primary and nursery start from 0001
+ * and do not continue from where secondary stopped.
  */
 /**
  * The year that goes into a secondary admission number: the first year of the
@@ -1416,8 +1413,7 @@ async function generateAdmissionNo(env, level, className, sessionJoined) {
   const section = admissionSection(level, className);
   let prefix;
   if (section === "secondary") prefix = `FISS/${admissionYearFor(sessionJoined)}/`;
-  else if (section === "nursery") prefix = "FIS/N/";
-  else prefix = "FIS/P/";
+  else prefix = `FISP/${admissionYearFor(sessionJoined)}/`;
 
   const { results } = await env.DB
     .prepare("SELECT admission_no FROM students WHERE admission_no LIKE ? ORDER BY admission_no DESC LIMIT 1")
@@ -1532,7 +1528,7 @@ async function handleRosterRoutes(request, env, url) {
       return json({ error: `As a ${restriction} admin, you can only add ${restriction} students.` }, 403);
     }
 
-    if (level === "secondary" && !/(?:19|20)\d{2}/.test(sessionJoined || "")) {
+    if ((level === "secondary" || level === "primary") && !/(?:19|20)\d{2}/.test(sessionJoined || "")) {
       return json({ error: "Enter the session this student joined (for example 2024/2025). It sets the year in the admission number." }, 400);
     }
 
