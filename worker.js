@@ -1495,7 +1495,7 @@ async function handleRosterRoutes(request, env, url) {
   // ---------------- ADMIN: GET (AND CREATE IF MISSING) VERIFY CODES FOR ID CARDS ----------------
   if (pathname === "/api/students/verify-codes" && request.method === "POST") {
     const sessionCtx = await getSession(request, env);
-    if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
+    if (!isGeneralAdmin(sessionCtx)) return json({ error: "Only the general admin can print ID cards." }, 403);
 
     const body = await request.json();
     const ids = Array.isArray(body.studentIds) ? body.studentIds.map(String).slice(0, 400) : [];
