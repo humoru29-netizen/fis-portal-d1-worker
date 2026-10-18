@@ -1440,8 +1440,103 @@ function generatePin() {
   return String(Math.floor(100000 + Math.random() * 900000));
 }
 
+/**
+ * Student ID card QR codes.
+ * Every student gets one permanent random verify_code (never changes, so a printed card
+ * never goes out of date). The QR on the card opens <portal>/?v=<code>, which calls the
+ * public endpoint below. That endpoint only ever returns name, current class and level,
+ * read live from the database, so a promotion updates what a scan shows. It never
+ * returns the PIN, photo, date of birth, phone numbers or admission number.
+ *
+ * Migration (run once in the D1 console, before deploying this file):
+ *   ALTER TABLE students ADD COLUMN verify_code TEXT;
+ *   CREATE UNIQUE INDEX IF NOT EXISTS idx_students_verify_code ON students(verify_code);
+ */
+const VERIFY_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no 0/O/1/I to avoid misreading
+function generateVerifyCode() {
+  const bytes = crypto.getRandomValues(new Uint8Array(12));
+  let out = "";
+  for (let i = 0; i < bytes.length; i++) out += VERIFY_ALPHABET[bytes[i] % VERIFY_ALPHABET.length];
+  return out; // 12 chars from 32 symbols = 60 bits, not guessable
+}
+
 async function handleRosterRoutes(request, env, url) {
   const { pathname } = url;
+
+  // ---------------- PUBLIC: VERIFY A STUDENT ID CARD (QR scan) ----------------
+  if (pathname === "/api/public/verify-student" && request.method === "GET") {
+    const code = (url.searchParams.get("code") || "").trim().toUpperCase();
+    if (!/^[A-Z2-9]{8,32}$/.test(code)) {
+      return json({ valid: false, error: "This QR code is not recognised." }, 404);
+    }
+    const row = await env.DB
+      .prepare(
+        `SELECT s.name, s.level, s.status, c.name AS class_name
+         FROM students s LEFT JOIN classes c ON c.id = s.class_id
+         WHERE s.verify_code = ?`
+      )
+      .bind(code)
+      .first();
+    if (!row) return json({ valid: false, error: "This QR code is not recognised." }, 404);
+
+    // Removed or graduated pupils: confirm the card is no longer active, reveal nothing else.
+    if (row.status !== "active") {
+      return json({ valid: false, inactive: true, school: "Faith International School, Itobe" });
+    }
+    return json({
+      valid: true,
+      school: "Faith International School, Itobe",
+      name: row.name,
+      className: row.class_name || "",
+      level: row.level
+    });
+  }
+
+  // ---------------- ADMIN: GET (AND CREATE IF MISSING) VERIFY CODES FOR ID CARDS ----------------
+  if (pathname === "/api/students/verify-codes" && request.method === "POST") {
+    const sessionCtx = await getSession(request, env);
+    if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    const body = await request.json();
+    const ids = Array.isArray(body.studentIds) ? body.studentIds.map(String).slice(0, 400) : [];
+    if (!ids.length) return json({ error: "studentIds is required." }, 400);
+
+    const restriction = adminLevelRestriction(sessionCtx);
+    const codes = {};
+
+    for (let i = 0; i < ids.length; i += 50) {
+      const chunk = ids.slice(i, i + 50);
+      const marks = chunk.map(() => "?").join(",");
+      const { results } = await env.DB
+        .prepare(`SELECT id, level, verify_code FROM students WHERE id IN (${marks})`)
+        .bind(...chunk)
+        .all();
+
+      const toFill = [];
+      for (const r of results) {
+        if (restriction && r.level !== restriction) continue; // level-scoped admins: own level only
+        if (r.verify_code) codes[r.id] = r.verify_code;
+        else toFill.push(r.id);
+      }
+
+      if (toFill.length) {
+        await env.DB.batch(
+          toFill.map((id) =>
+            env.DB
+              .prepare("UPDATE students SET verify_code = ? WHERE id = ? AND verify_code IS NULL")
+              .bind(generateVerifyCode(), id)
+          )
+        );
+        const m2 = toFill.map(() => "?").join(",");
+        const { results: filled } = await env.DB
+          .prepare(`SELECT id, verify_code FROM students WHERE id IN (${m2})`)
+          .bind(...toFill)
+          .all();
+        for (const r of filled) if (r.verify_code) codes[r.id] = r.verify_code;
+      }
+    }
+    return json({ codes });
+  }
 
   // ---------------- LIST CLASSES ----------------
   if (pathname === "/api/classes" && request.method === "GET") {
@@ -4604,7 +4699,7 @@ async function handleBirthdayRoutes(request, env, url) {
  *   GET /api/audit?limit=  (auth: general_admin) newest first, max 500
  *   Each entry includes a ready-made "when" string in Nigeria time.
  */
-const AUDIT_SKIP_PATHS = ["/api/login", "/api/student-login", "/api/refresh", "/api/signup", "/api/admissions/apply", "/api/audit", "/api/scan-roster"];
+const AUDIT_SKIP_PATHS = ["/api/login", "/api/student-login", "/api/refresh", "/api/signup", "/api/admissions/apply", "/api/audit", "/api/scan-roster", "/api/students/verify-codes"];
 
 function auditCap(s, n) {
   const t = String(s == null ? "" : s);
