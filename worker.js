@@ -1460,6 +1460,19 @@ function generateVerifyCode() {
   return out; // 12 chars from 32 symbols = 60 bits, not guessable
 }
 
+/**
+ * School houses. The portal page decides the house names and colours; the Worker only stores a short key
+ * such as "red". Returns null for "no house", the cleaned key, or false when the value is not usable.
+ *
+ * Migration (run once in the D1 console, before deploying):
+ *   ALTER TABLE students ADD COLUMN house TEXT;
+ */
+function cleanHouse(v) {
+  if (v === null || v === undefined || v === "") return null;
+  const k = String(v).trim().toLowerCase();
+  return /^[a-z0-9_-]{1,20}$/.test(k) ? k : false;
+}
+
 async function handleRosterRoutes(request, env, url) {
   const { pathname } = url;
 
@@ -1490,6 +1503,25 @@ async function handleRosterRoutes(request, env, url) {
       className: row.class_name || "",
       level: row.level
     });
+  }
+
+  // ---------------- ADMIN: ASSIGN HOUSES TO MANY STUDENTS AT ONCE ----------------
+  if (pathname === "/api/students/assign-houses" && request.method === "POST") {
+    const sessionCtx = await getSession(request, env);
+    if (!isGeneralAdmin(sessionCtx)) return json({ error: "Only the general admin can assign houses in bulk." }, 403);
+
+    const body = await request.json();
+    const list = Array.isArray(body.assignments) ? body.assignments.slice(0, 400) : [];
+    if (!list.length) return json({ error: "assignments is required." }, 400);
+
+    const stmts = [];
+    for (const a of list) {
+      const key = cleanHouse(a && a.house);
+      if (key === false || !a || !a.id) return json({ error: "One of the assignments is not valid." }, 400);
+      stmts.push(env.DB.prepare("UPDATE students SET house = ? WHERE id = ? AND status = 'active'").bind(key, String(a.id)));
+    }
+    for (let i = 0; i < stmts.length; i += 50) await env.DB.batch(stmts.slice(i, i + 50));
+    return json({ message: "Houses updated.", count: stmts.length });
   }
 
   // ---------------- ADMIN: GET (AND CREATE IF MISSING) VERIFY CODES FOR ID CARDS ----------------
@@ -1614,10 +1646,12 @@ async function handleRosterRoutes(request, env, url) {
     const sessionCtx = await getSession(request, env);
     if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
 
-    const { name, classId, level, sessionJoined, guardianName, guardianPhone, gender } = await request.json();
+    const { name, classId, level, sessionJoined, guardianName, guardianPhone, gender, house } = await request.json();
     if (!name || !classId || !level) {
       return json({ error: "name, classId, and level are required." }, 400);
     }
+    const houseKey = cleanHouse(house);
+    if (houseKey === false) return json({ error: "That house is not valid." }, 400);
     const restriction = adminLevelRestriction(sessionCtx);
     if (restriction && level !== restriction) {
       return json({ error: `As a ${restriction} admin, you can only add ${restriction} students.` }, 403);
@@ -1637,6 +1671,8 @@ async function handleRosterRoutes(request, env, url) {
       )
       .bind(id, admissionNo, name, classId, level, sessionJoined || null, guardianName || null, guardianPhone || null, (gender === "Male" || gender === "Female") ? gender : null)
       .run();
+
+    if (houseKey) await env.DB.prepare("UPDATE students SET house = ? WHERE id = ?").bind(houseKey, id).run();
 
     return json({ message: "Student added.", id, admissionNo });
   }
@@ -2214,10 +2250,13 @@ async function handleRosterRoutes(request, env, url) {
       return json({ error: "Not authorised for this student." }, 403);
     }
 
-    const { name, classId, sessionJoined, guardianName, guardianPhone, dob, gender } = await request.json();
+    const { name, classId, sessionJoined, guardianName, guardianPhone, dob, gender, house } = await request.json();
     if (!name || !classId) {
       return json({ error: "name and classId are required." }, 400);
     }
+    // house: leave unchanged when the field is not sent; "" clears it
+    const houseKey = house === undefined ? undefined : cleanHouse(house);
+    if (houseKey === false) return json({ error: "That house is not valid." }, 400);
 
     // If moving the student to a different class, that class must be within
     // the admin's level restriction too (a level admin can't move a student
@@ -2237,6 +2276,10 @@ async function handleRosterRoutes(request, env, url) {
       )
       .bind(name, classId, newLevel, sessionJoined || null, guardianName || null, guardianPhone || null, dob || null, (gender === "Male" || gender === "Female") ? gender : null, studentId)
       .run();
+
+    if (houseKey !== undefined) {
+      await env.DB.prepare("UPDATE students SET house = ? WHERE id = ?").bind(houseKey, studentId).run();
+    }
 
     return json({ message: "Student updated." });
   }
