@@ -1762,8 +1762,9 @@ async function handleRosterRoutes(request, env, url) {
   if (photoMatch) {
     const studentId = photoMatch[1];
     const sessionCtx = await getSession(request, env);
-    const isSelf = sessionCtx && sessionCtx.type === "student" && sessionCtx.id === studentId;
-    if (!isSelf && !isTeachingStaff(sessionCtx)) return json({ error: "Not authorised." }, 403);
+    // Students may not change their own photo any more; only staff can (from the Roster).
+    const isSelf = false;
+    if (!isTeachingStaff(sessionCtx)) return json({ error: "Not authorised." }, 403);
 
     const student = await env.DB
       .prepare("SELECT id, level FROM students WHERE id = ?")
