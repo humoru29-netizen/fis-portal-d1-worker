@@ -1473,6 +1473,48 @@ function cleanHouse(v) {
   return /^[a-z0-9_-]{1,20}$/.test(k) ? k : false;
 }
 
+/**
+ * Student ID card serial number, issue date and expiry date.
+ * Serial = FIS + year + 4-digit number for secondary, FISP + year + 4-digit number for
+ * primary and nursery (two separate series, each restarting at 0001 every year).
+ * The serial, issue date and expiry are saved the first time a card is printed and are
+ * never recalculated, so a reprint always shows the same values.
+ * Expiry = 31 August of the year the student finishes their final class, worked out from
+ * the class name (JSS 1-3, SS 1-3, Primary/Basic/Pry 1-6). Any other class (for example
+ * Nursery) is counted by following the "Promotes to" chain set in Manage Classes.
+ *
+ * Migration (run once in the D1 console, before deploying this file):
+ *   ALTER TABLE students ADD COLUMN card_serial TEXT;
+ *   ALTER TABLE students ADD COLUMN card_issued TEXT;
+ *   ALTER TABLE students ADD COLUMN card_expiry TEXT;
+ *   CREATE UNIQUE INDEX IF NOT EXISTS idx_students_card_serial ON students(card_serial);
+ */
+function cardYearsToFinish(cls, classById) {
+  const n = String((cls && cls.name) || "").toUpperCase().replace(/\s+/g, " ").trim();
+  let m = n.match(/\bJSS?\s*([1-3])/);
+  if (m && /\bJSS/.test(n)) return 6 - Number(m[1]);          // JSS1 -> 5 ... JSS3 -> 3
+  m = n.match(/\bSSS?\s*([1-3])/);
+  if (m) return 3 - Number(m[1]);                              // SS1 -> 2 ... SS3 -> 0
+  m = n.match(/\b(?:PRIMARY|PRIM|PRY|BASIC)\s*([1-6])/);
+  if (m) return 6 - Number(m[1]);                              // Primary 1 -> 5 ... Primary 6 -> 0
+  // Anything else (e.g. Nursery): count the "Promotes to" steps up to the final class
+  let hops = 0;
+  let cur = cls;
+  while (cur && cur.next_class_id && hops < 20) {
+    cur = classById[cur.next_class_id];
+    hops++;
+  }
+  return hops > 0 ? hops : null;
+}
+
+async function lastCardSerialNo(env, stem) {
+  const row = await env.DB
+    .prepare("SELECT card_serial FROM students WHERE card_serial LIKE ? ORDER BY card_serial DESC LIMIT 1")
+    .bind(stem + "%")
+    .first();
+  return row && row.card_serial ? parseInt(String(row.card_serial).slice(stem.length), 10) || 0 : 0;
+}
+
 async function handleRosterRoutes(request, env, url) {
   const { pathname } = url;
 
@@ -1568,6 +1610,102 @@ async function handleRosterRoutes(request, env, url) {
       }
     }
     return json({ codes });
+  }
+
+  // ---------------- ADMIN: GET (AND CREATE IF MISSING) CARD SERIAL, ISSUE DATE AND EXPIRY ----------------
+  if (pathname === "/api/students/card-serials" && request.method === "POST") {
+    const sessionCtx = await getSession(request, env);
+    if (!isGeneralAdmin(sessionCtx)) return json({ error: "Only the general admin can print ID cards." }, 403);
+
+    const body = await request.json();
+    const ids = Array.isArray(body.studentIds) ? body.studentIds.map(String).slice(0, 400) : [];
+    if (!ids.length) return json({ error: "studentIds is required." }, 400);
+
+    const restriction = adminLevelRestriction(sessionCtx);
+
+    // Today in Nigeria (UTC+1). A school session runs September to August, so from
+    // September onward the current session ends next year.
+    const lagos = new Date(Date.now() + 3600 * 1000);
+    const today = lagos.toISOString().slice(0, 10);
+    const year = lagos.getUTCFullYear();
+    const sessionEndYear = lagos.getUTCMonth() + 1 >= 9 ? year + 1 : year;
+
+    let classRows;
+    try {
+      ({ results: classRows } = await env.DB.prepare("SELECT id, name, sort_order, next_class_id FROM classes").all());
+    } catch (e) {
+      ({ results: classRows } = await env.DB.prepare("SELECT id, name, sort_order FROM classes").all());
+    }
+    const classById = {};
+    for (const c of classRows) classById[c.id] = c;
+
+    const rows = [];
+    for (let i = 0; i < ids.length; i += 50) {
+      const chunk = ids.slice(i, i + 50);
+      const marks = chunk.map(() => "?").join(",");
+      const { results } = await env.DB
+        .prepare(`SELECT id, name, level, class_id, card_serial FROM students WHERE status = 'active' AND id IN (${marks})`)
+        .bind(...chunk)
+        .all();
+      for (const r of results) {
+        if (restriction && r.level !== restriction) continue; // level-scoped admins: own level only
+        rows.push(r);
+      }
+    }
+
+    // Students without a serial yet, numbered in class order, then by name
+    const toAssign = rows
+      .filter((r) => !r.card_serial)
+      .sort((a, b) => {
+        const ca = classById[a.class_id], cb = classById[b.class_id];
+        const sa = ca ? Number(ca.sort_order) || 0 : 0, sb = cb ? Number(cb.sort_order) || 0 : 0;
+        return sa - sb || String(a.name).localeCompare(String(b.name));
+      });
+
+    const counters = {};
+    const skipped = [];
+    for (const r of toAssign) {
+      const cls = classById[r.class_id];
+      const yearsLeft = cardYearsToFinish(cls, classById);
+      if (yearsLeft === null) {
+        skipped.push({ id: r.id, name: r.name, reason: "The class \"" + (cls ? cls.name : "unknown") + "\" is not recognised, so the expiry date cannot be worked out." });
+        continue;
+      }
+      const expiry = (sessionEndYear + yearsLeft) + "-08-31";
+      const stem = (r.level === "secondary" ? "FIS" : "FISP") + year;
+
+      let done = false;
+      for (let attempt = 0; attempt < 6 && !done; attempt++) {
+        if (counters[stem] === undefined || attempt > 0) counters[stem] = await lastCardSerialNo(env, stem);
+        const serial = stem + String(counters[stem] + 1).padStart(4, "0");
+        try {
+          const res = await env.DB
+            .prepare("UPDATE students SET card_serial = ?, card_issued = ?, card_expiry = ? WHERE id = ? AND card_serial IS NULL")
+            .bind(serial, today, expiry, r.id)
+            .run();
+          if (res && res.meta && res.meta.changes) counters[stem] += 1;
+          done = true;
+        } catch (e) {
+          if (!/UNIQUE|constraint/i.test(String((e && e.message) || e))) throw e; // number taken meanwhile: try the next one
+        }
+      }
+      if (!done) skipped.push({ id: r.id, name: r.name, reason: "Could not reserve a serial number. Try again." });
+    }
+
+    const cards = {};
+    const allIds = rows.map((r) => r.id);
+    for (let i = 0; i < allIds.length; i += 50) {
+      const chunk = allIds.slice(i, i + 50);
+      const marks = chunk.map(() => "?").join(",");
+      const { results } = await env.DB
+        .prepare(`SELECT id, card_serial, card_issued, card_expiry FROM students WHERE id IN (${marks})`)
+        .bind(...chunk)
+        .all();
+      for (const r of results) {
+        if (r.card_serial) cards[r.id] = { serial: r.card_serial, issued: r.card_issued, expiry: r.card_expiry };
+      }
+    }
+    return json({ cards, skipped });
   }
 
   // ---------------- LIST CLASSES ----------------
