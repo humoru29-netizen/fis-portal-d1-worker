@@ -1409,11 +1409,31 @@ function admissionYearFor(sessionJoined) {
   return String(now.getMonth() >= 8 ? now.getFullYear() : now.getFullYear() - 1);
 }
 
+/**
+ * Secondary students' admission year is fixed by their class, the same for the whole class:
+ * JSS1 = this session's start year, JSS2 = one year earlier ... SS3 = five years earlier
+ * (e.g. in the 2026/2027 session: JSS1 2026, JSS2 2025, JSS3 2024, SS1 2023, SS2 2022, SS3 2021).
+ * Returns null when the class name is not a recognisable JSS/SS class.
+ */
+function secondaryYearFromClass(className) {
+  const n = String(className || "").toUpperCase().replace(/\s+/g, " ").trim();
+  let m = n.match(/\bJSS\s*([1-3])/);
+  let grade = m ? Number(m[1]) : 0;
+  if (!grade) {
+    m = n.match(/\bSSS?\s*([1-3])/);
+    grade = m ? 3 + Number(m[1]) : 0;
+  }
+  if (!grade) return null;
+  return Number(admissionYearFor("")) - (grade - 1);
+}
+
 async function generateAdmissionNo(env, level, className, sessionJoined) {
   const section = admissionSection(level, className);
   let prefix;
-  if (section === "secondary") prefix = `FISS/${admissionYearFor(sessionJoined)}/`;
-  else prefix = `FISP/${admissionYearFor(sessionJoined)}/`;
+  if (section === "secondary") {
+    const classYear = secondaryYearFromClass(className);
+    prefix = `FISS/${classYear !== null ? classYear : admissionYearFor(sessionJoined)}/`;
+  } else prefix = `FISP/${admissionYearFor(sessionJoined)}/`;
 
   const { results } = await env.DB
     .prepare("SELECT admission_no FROM students WHERE admission_no LIKE ? ORDER BY admission_no DESC LIMIT 1")
@@ -1795,19 +1815,26 @@ async function handleRosterRoutes(request, env, url) {
       return json({ error: `As a ${restriction} admin, you can only add ${restriction} students.` }, 403);
     }
 
-    if ((level === "secondary" || level === "primary") && !/(?:19|20)\d{2}/.test(sessionJoined || "")) {
+    const classRow = await env.DB.prepare("SELECT name FROM classes WHERE id = ?").bind(classId).first();
+
+    // Secondary: the admission year comes from the class, so Session Joined is filled in automatically
+    let sessionJoinedFinal = sessionJoined;
+    if (level === "secondary") {
+      const classYear = secondaryYearFromClass(classRow ? classRow.name : "");
+      if (classYear !== null) sessionJoinedFinal = classYear + "/" + (classYear + 1);
+    }
+    if ((level === "secondary" || level === "primary") && !/(?:19|20)\d{2}/.test(sessionJoinedFinal || "")) {
       return json({ error: "Enter the session this student joined (for example 2024/2025). It sets the year in the admission number." }, 400);
     }
 
-    const classRow = await env.DB.prepare("SELECT name FROM classes WHERE id = ?").bind(classId).first();
-    const admissionNo = await generateAdmissionNo(env, level, classRow ? classRow.name : "", sessionJoined);
+    const admissionNo = await generateAdmissionNo(env, level, classRow ? classRow.name : "", sessionJoinedFinal);
     const id = uuid();
     await env.DB
       .prepare(
         `INSERT INTO students (id, admission_no, name, class_id, level, session_joined, guardian_name, guardian_phone, gender, status, created_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', datetime('now'))`
       )
-      .bind(id, admissionNo, name, classId, level, sessionJoined || null, guardianName || null, guardianPhone || null, (gender === "Male" || gender === "Female") ? gender : null)
+      .bind(id, admissionNo, name, classId, level, sessionJoinedFinal || null, guardianName || null, guardianPhone || null, (gender === "Male" || gender === "Female") ? gender : null)
       .run();
 
     if (houseKey) await env.DB.prepare("UPDATE students SET house = ? WHERE id = ?").bind(houseKey, id).run();
