@@ -1576,13 +1576,13 @@ async function handleRosterRoutes(request, env, url) {
       return json({ valid: false, error: "This QR code is not recognised." }, 404);
     }
     const row = await env.DB
-      .prepare("SELECT id, name, level, phone, staff_no, status, role FROM users WHERE verify_code = ?")
+      .prepare("SELECT id, name, level, phone, staff_no, status, role, job_title FROM users WHERE verify_code = ?")
       .bind(code)
       .first();
     if (!row) return json({ valid: false, error: "This QR code is not recognised." }, 404);
 
     // Suspended / removed accounts: confirm the card is no longer active, reveal nothing else.
-    if (row.status !== "active" || row.role !== "teacher") {
+    if (row.status !== "active") {
       return json({ valid: false, inactive: true, school: "Faith International School, Itobe" });
     }
 
@@ -1609,6 +1609,7 @@ async function handleRosterRoutes(request, env, url) {
       school: "Faith International School, Itobe",
       name: row.name,
       staffNo: row.staff_no || "",
+      jobTitle: row.job_title || (row.role === "teacher" ? "Teacher" : ""),
       level: row.level || "",
       phone: row.phone || "",
       subjects
@@ -2854,6 +2855,7 @@ async function handleManageAccountsRoutes(request, env, url) {
 
     const baseCols = "id, name, email, phone, dob, role, level, status, created_at, approved_by, approved_at";
     const tiers = [
+      baseCols + ", photo_url, staff_no, signature_url, job_title",
       baseCols + ", photo_url, staff_no, signature_url",
       baseCols + ", photo_url, staff_no", // signature_url column not added yet (migration-teacher-signature.sql)
       baseCols                            // photo_url / staff_no not added yet (migration-teacher-cards.sql)
@@ -2920,6 +2922,27 @@ async function handleManageAccountsRoutes(request, env, url) {
     return json({ message: url ? "Photo saved." : "Photo removed.", photoUrl: url });
   }
 
+  // ---------------- SET A STAFF MEMBER'S JOB TITLE (printed as "Position" on the ID card) ----------------
+  const jobTitleMatch = pathname.match(/^\/api\/staff\/([^/]+)\/job-title$/);
+  if (jobTitleMatch && request.method === "PATCH") {
+    const sessionCtx = await getSession(request, env);
+    if (!isGeneralAdmin(sessionCtx)) return json({ error: "Not authorised. Only the General Admin can manage accounts." }, 403);
+
+    const staffId = jobTitleMatch[1];
+    const body = await request.json();
+    const title = String(body.jobTitle || "").trim().slice(0, 60) || null;
+
+    const target = await env.DB.prepare("SELECT id FROM users WHERE id = ?").bind(staffId).first();
+    if (!target) return json({ error: "Account not found." }, 404);
+
+    try {
+      await env.DB.prepare("UPDATE users SET job_title = ? WHERE id = ?").bind(title, staffId).run();
+    } catch (e) {
+      return json({ error: "Could not save the title.", detail: String(e && e.message || e) }, 500);
+    }
+    return json({ message: title ? "Title saved." : "Title cleared.", jobTitle: title });
+  }
+
   // ---------------- SET A STAFF MEMBER'S SIGNATURE IMAGE (printed on the teacher ID card) ----------------
   const staffSigMatch = pathname.match(/^\/api\/staff\/([^/]+)\/signature$/);
   if (staffSigMatch && request.method === "PATCH") {
@@ -2958,7 +2981,7 @@ async function handleManageAccountsRoutes(request, env, url) {
       const chunk = ids.slice(i, i + 50);
       const marks = chunk.map(() => "?").join(",");
       const { results } = await env.DB
-        .prepare(`SELECT id, name, staff_no, verify_code FROM users WHERE role = 'teacher' AND status = 'active' AND id IN (${marks})`)
+        .prepare(`SELECT id, name, staff_no, verify_code FROM users WHERE status = 'active' AND id IN (${marks})`)
         .bind(...chunk)
         .all();
       rows.push(...results);
