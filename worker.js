@@ -1567,6 +1567,54 @@ async function handleRosterRoutes(request, env, url) {
     });
   }
 
+  // ---------------- PUBLIC: VERIFY A TEACHER ID CARD (QR scan) ----------------
+  // Shows the teacher's name, Staff ID, section, phone number and the subjects (with classes)
+  // they teach, read live from the records. Needs the teacher's random verify_code from the card.
+  if (pathname === "/api/public/verify-teacher" && request.method === "GET") {
+    const code = (url.searchParams.get("code") || "").trim().toUpperCase();
+    if (!/^[A-Z2-9]{8,32}$/.test(code)) {
+      return json({ valid: false, error: "This QR code is not recognised." }, 404);
+    }
+    const row = await env.DB
+      .prepare("SELECT id, name, level, phone, staff_no, status, role FROM users WHERE verify_code = ?")
+      .bind(code)
+      .first();
+    if (!row) return json({ valid: false, error: "This QR code is not recognised." }, 404);
+
+    // Suspended / removed accounts: confirm the card is no longer active, reveal nothing else.
+    if (row.status !== "active" || row.role !== "teacher") {
+      return json({ valid: false, inactive: true, school: "Faith International School, Itobe" });
+    }
+
+    const { results } = await env.DB
+      .prepare(
+        `SELECT s.name AS subject, c.name AS class_name
+         FROM teacher_assignments ta
+         JOIN subjects s ON s.id = ta.subject_id
+         JOIN classes c ON c.id = ta.class_id
+         WHERE ta.teacher_id = ?
+         ORDER BY s.name, c.sort_order`
+      )
+      .bind(row.id)
+      .all();
+    const bySubject = {};
+    for (const r of results) {
+      if (!bySubject[r.subject]) bySubject[r.subject] = [];
+      bySubject[r.subject].push(r.class_name);
+    }
+    const subjects = Object.keys(bySubject).map((s) => ({ subject: s, classes: bySubject[s] }));
+
+    return json({
+      valid: true,
+      school: "Faith International School, Itobe",
+      name: row.name,
+      staffNo: row.staff_no || "",
+      level: row.level || "",
+      phone: row.phone || "",
+      subjects
+    });
+  }
+
   // ---------------- ADMIN: ASSIGN HOUSES TO MANY STUDENTS AT ONCE ----------------
   if (pathname === "/api/students/assign-houses" && request.method === "POST") {
     const sessionCtx = await getSession(request, env);
@@ -2804,12 +2852,23 @@ async function handleManageAccountsRoutes(request, env, url) {
     const sessionCtx = await getSession(request, env);
     if (!isGeneralAdmin(sessionCtx)) return json({ error: "Not authorised. Only the General Admin can manage accounts." }, 403);
 
-    const { results } = await env.DB
-      .prepare(
-        `SELECT id, name, email, phone, dob, role, level, status, created_at, approved_by, approved_at
-         FROM users WHERE status IN ('active', 'suspended') ORDER BY name`
-      )
-      .all();
+    const baseCols = "id, name, email, phone, dob, role, level, status, created_at, approved_by, approved_at";
+    const tiers = [
+      baseCols + ", photo_url, staff_no, signature_url",
+      baseCols + ", photo_url, staff_no", // signature_url column not added yet (migration-teacher-signature.sql)
+      baseCols                            // photo_url / staff_no not added yet (migration-teacher-cards.sql)
+    ];
+    let results;
+    for (let i = 0; i < tiers.length; i++) {
+      try {
+        ({ results } = await env.DB
+          .prepare(`SELECT ${tiers[i]} FROM users WHERE status IN ('active', 'suspended') ORDER BY name`)
+          .all());
+        break;
+      } catch (e) {
+        if (i === tiers.length - 1) throw e;
+      }
+    }
 
     return json({ staff: results });
   }
@@ -2836,6 +2895,127 @@ async function handleManageAccountsRoutes(request, env, url) {
       .run();
 
     return json({ message: "Account updated." });
+  }
+
+  // ---------------- SET/CLEAR A STAFF MEMBER'S PHOTO (for teacher ID cards) ----------------
+  const staffPhotoMatch = pathname.match(/^\/api\/staff\/([^/]+)\/photo$/);
+  if (staffPhotoMatch && request.method === "PATCH") {
+    const sessionCtx = await getSession(request, env);
+    if (!isGeneralAdmin(sessionCtx)) return json({ error: "Not authorised. Only the General Admin can manage accounts." }, 403);
+
+    const staffId = staffPhotoMatch[1];
+    const { photoUrl } = await request.json();
+    let url = null;
+    if (photoUrl) {
+      if (typeof photoUrl !== "string" || !/^https:\/\/res\.cloudinary\.com\//.test(photoUrl)) {
+        return json({ error: "That photo link is not valid." }, 400);
+      }
+      url = photoUrl;
+    }
+
+    const target = await env.DB.prepare("SELECT id FROM users WHERE id = ?").bind(staffId).first();
+    if (!target) return json({ error: "Account not found." }, 404);
+
+    await env.DB.prepare("UPDATE users SET photo_url = ? WHERE id = ?").bind(url, staffId).run();
+    return json({ message: url ? "Photo saved." : "Photo removed.", photoUrl: url });
+  }
+
+  // ---------------- SET A STAFF MEMBER'S SIGNATURE IMAGE (printed on the teacher ID card) ----------------
+  const staffSigMatch = pathname.match(/^\/api\/staff\/([^/]+)\/signature$/);
+  if (staffSigMatch && request.method === "PATCH") {
+    const sessionCtx = await getSession(request, env);
+    if (!isGeneralAdmin(sessionCtx)) return json({ error: "Not authorised. Only the General Admin can manage accounts." }, 403);
+
+    const staffId = staffSigMatch[1];
+    const { signatureUrl } = await request.json();
+    let url = null;
+    if (signatureUrl) {
+      if (typeof signatureUrl !== "string" || !/^https:\/\/res\.cloudinary\.com\//.test(signatureUrl)) {
+        return json({ error: "That signature link is not valid." }, 400);
+      }
+      url = signatureUrl;
+    }
+
+    const target = await env.DB.prepare("SELECT id FROM users WHERE id = ?").bind(staffId).first();
+    if (!target) return json({ error: "Account not found." }, 404);
+
+    await env.DB.prepare("UPDATE users SET signature_url = ? WHERE id = ?").bind(url, staffId).run();
+    return json({ message: url ? "Signature saved." : "Signature removed.", signatureUrl: url });
+  }
+
+  // ---------------- TEACHER ID CARDS: STAFF ID NUMBERS (FIST0001, FIST0002 ...) ----------------
+  // Created the first time a teacher's card is printed, then reused so it never changes.
+  if (pathname === "/api/staff/card-ids" && request.method === "POST") {
+    const sessionCtx = await getSession(request, env);
+    if (!isGeneralAdmin(sessionCtx)) return json({ error: "Only the General Admin can print teacher ID cards." }, 403);
+
+    const body = await request.json();
+    const ids = Array.isArray(body.staffIds) ? body.staffIds.map(String).slice(0, 200) : [];
+    if (!ids.length) return json({ error: "staffIds is required." }, 400);
+
+    const rows = [];
+    for (let i = 0; i < ids.length; i += 50) {
+      const chunk = ids.slice(i, i + 50);
+      const marks = chunk.map(() => "?").join(",");
+      const { results } = await env.DB
+        .prepare(`SELECT id, name, staff_no, verify_code FROM users WHERE role = 'teacher' AND status = 'active' AND id IN (${marks})`)
+        .bind(...chunk)
+        .all();
+      rows.push(...results);
+    }
+
+    const lastNo = async () => {
+      const r = await env.DB
+        .prepare("SELECT staff_no FROM users WHERE staff_no LIKE 'FIST%' ORDER BY staff_no DESC LIMIT 1")
+        .first();
+      return r && r.staff_no ? parseInt(String(r.staff_no).slice(4), 10) || 0 : 0;
+    };
+
+    const toAssign = rows.filter((r) => !r.staff_no).sort((a, b) => String(a.name).localeCompare(String(b.name)));
+    let counter;
+    const skipped = [];
+    for (const r of toAssign) {
+      let done = false;
+      for (let attempt = 0; attempt < 6 && !done; attempt++) {
+        if (counter === undefined || attempt > 0) counter = await lastNo();
+        const staffNo = "FIST" + String(counter + 1).padStart(4, "0");
+        try {
+          const res = await env.DB
+            .prepare("UPDATE users SET staff_no = ? WHERE id = ? AND staff_no IS NULL")
+            .bind(staffNo, r.id)
+            .run();
+          if (res && res.meta && res.meta.changes) counter += 1;
+          done = true;
+        } catch (e) {
+          if (!/UNIQUE|constraint/i.test(String((e && e.message) || e))) throw e;
+        }
+      }
+      if (!done) skipped.push({ id: r.id, name: r.name });
+    }
+
+    // Permanent random code for the QR on the card (never changes, so a printed card keeps working)
+    const needCode = rows.filter((r) => !r.verify_code);
+    for (let i = 0; i < needCode.length; i += 50) {
+      await env.DB.batch(
+        needCode.slice(i, i + 50).map((r) =>
+          env.DB
+            .prepare("UPDATE users SET verify_code = ? WHERE id = ? AND verify_code IS NULL")
+            .bind(generateVerifyCode(), r.id)
+        )
+      );
+    }
+
+    const cards = {};
+    for (let i = 0; i < rows.length; i += 50) {
+      const chunk = rows.slice(i, i + 50).map((r) => r.id);
+      const marks = chunk.map(() => "?").join(",");
+      const { results } = await env.DB
+        .prepare(`SELECT id, staff_no, verify_code FROM users WHERE id IN (${marks})`)
+        .bind(...chunk)
+        .all();
+      for (const r of results) if (r.staff_no) cards[r.id] = { staffNo: r.staff_no, code: r.verify_code || "" };
+    }
+    return json({ cards, skipped });
   }
 
   // ---------------- SET/UPDATE PHONE (used for SMS notifications) ----------------
