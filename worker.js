@@ -6828,8 +6828,9 @@ async function pkRemove(request, env) {
     if (me.role !== "general_admin") return pkJson({ error: "Not allowed." }, 403);
     targetId = String(b.userId);
   }
-  await env.DB.prepare("DELETE FROM passkeys WHERE user_id = ?").bind(targetId).run();
-  return pkJson({ ok: true });
+  const res = await env.DB.prepare("DELETE FROM passkeys WHERE user_id = ?").bind(targetId).run();
+  const removed = res && res.meta && typeof res.meta.changes === "number" ? res.meta.changes : null;
+  return pkJson({ ok: true, removed });
 }
 
 // =====================================================================
