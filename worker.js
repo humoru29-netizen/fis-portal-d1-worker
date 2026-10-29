@@ -5111,7 +5111,7 @@ async function handleBirthdayRoutes(request, env, url) {
  *   GET /api/audit?limit=  (auth: general_admin) newest first, max 500
  *   Each entry includes a ready-made "when" string in Nigeria time.
  */
-const AUDIT_SKIP_PATHS = ["/api/login", "/api/student-login", "/api/refresh", "/api/signup", "/api/admissions/apply", "/api/audit", "/api/scan-roster", "/api/students/verify-codes"];
+const AUDIT_SKIP_PATHS = ["/api/passkey/register/options", "/api/passkey/register/verify", "/api/passkey/login/options", "/api/passkey/login/verify", "/api/passkey/remove", "/api/login", "/api/student-login", "/api/refresh", "/api/signup", "/api/admissions/apply", "/api/audit", "/api/scan-roster", "/api/students/verify-codes"];
 
 function auditCap(s, n) {
   const t = String(s == null ? "" : s);
@@ -6506,9 +6506,337 @@ async function handleSmsRoutes(request, env, url) {
  */
 
 // =====================================================================
+// SECTION: Passkey (fingerprint / face) login — staff only
+//   POST /api/passkey/register/options   (auth: staff)
+//   POST /api/passkey/register/verify    (auth: staff)
+//   POST /api/passkey/login/options      { email }
+//   POST /api/passkey/login/verify       -> { token, user }
+//   POST /api/passkey/remove             (auth: staff; general_admin may pass { userId })
+// Tables: passkeys, passkey_challenges (see passkeys.sql)
+// =====================================================================
+const PASSKEY_RP_ID = "fissitobe.com.ng";               // frontend domain (no https://)
+const PASSKEY_RP_NAME = "Faith International School, Itobe";
+const PASSKEY_ORIGINS = ["https://fissitobe.com.ng", "https://www.fissitobe.com.ng"];
+const PASSKEY_CHALLENGE_TTL = 5 * 60;                    // seconds
+
+function pkJson(data, status = 200) {
+  return json(data, status); // CORS headers are added by the main fetch wrapper
+}
+
+async function pkAuthenticate(request, env) {
+  const s = await getSession(request, env);
+  if (!s || s.type !== "staff") return null;
+  return s.record; // users row: id, name, email, role, level, status ...
+}
+
+async function pkFindUserByEmail(env, email) {
+  return await env.DB.prepare("SELECT * FROM users WHERE email = ?")
+    .bind((email || "").toLowerCase()).first();
+}
+async function pkFindUserById(env, id) {
+  return await env.DB.prepare("SELECT * FROM users WHERE id = ?").bind(id).first();
+}
+
+async function pkBuildLoginResult(env, user) {
+  // Same account-status checks as /api/login
+  if (user.status === "pending") {
+    return { error: "Your account is awaiting administrator approval.", status: 403 };
+  }
+  if (user.status === "rejected") {
+    return { error: "This account request was not approved. Please contact the school administrator.", status: 403 };
+  }
+  if (user.status === "suspended") {
+    return { error: "This account has been suspended. Please contact the school administrator.", status: 403 };
+  }
+  const token = await signToken({ sub: user.id, type: "staff", role: user.role }, env.JWT_SECRET);
+  return { body: { token, user: { id: user.id, name: user.name, role: user.role, level: user.level } } };
+}
+
+// =====================================================================
+// Helpers
+// =====================================================================
+function pkB64uToBytes(s) {
+  s = s.replace(/-/g, "+").replace(/_/g, "/");
+  while (s.length % 4) s += "=";
+  const bin = atob(s);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+function pkBytesToB64u(bytes) {
+  bytes = new Uint8Array(bytes);
+  let s = "";
+  for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+  return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+function pkRandomChallenge() {
+  return pkBytesToB64u(crypto.getRandomValues(new Uint8Array(32)));
+}
+async function pkSha256(data) {
+  return new Uint8Array(await crypto.subtle.digest("SHA-256", data));
+}
+function pkEqual(a, b) {
+  if (a.length !== b.length) return false;
+  let d = 0;
+  for (let i = 0; i < a.length; i++) d |= a[i] ^ b[i];
+  return d === 0;
+}
+
+// ECDSA signatures from WebAuthn are DER; WebCrypto wants raw r||s (64 bytes)
+function pkDerToRaw(der) {
+  if (der[0] !== 0x30) throw new Error("bad signature");
+  let i = 2;
+  if (der[1] & 0x80) i = 2 + (der[1] & 0x7f);
+  if (der[i] !== 0x02) throw new Error("bad signature");
+  const rLen = der[i + 1];
+  let r = der.slice(i + 2, i + 2 + rLen);
+  i = i + 2 + rLen;
+  if (der[i] !== 0x02) throw new Error("bad signature");
+  const sLen = der[i + 1];
+  let s = der.slice(i + 2, i + 2 + sLen);
+  while (r.length > 32 && r[0] === 0) r = r.slice(1);
+  while (s.length > 32 && s[0] === 0) s = s.slice(1);
+  if (r.length > 32 || s.length > 32) throw new Error("bad signature");
+  const out = new Uint8Array(64);
+  out.set(r, 32 - r.length);
+  out.set(s, 64 - s.length);
+  return out;
+}
+
+async function pkStoreChallenge(env, challenge, userId, purpose) {
+  const now = Math.floor(Date.now() / 1000);
+  // clean old ones
+  await env.DB.prepare("DELETE FROM passkey_challenges WHERE expires_at < ?").bind(now).run();
+  await env.DB.prepare(
+    "INSERT INTO passkey_challenges (challenge, user_id, purpose, expires_at) VALUES (?, ?, ?, ?)"
+  ).bind(challenge, userId == null ? null : String(userId), purpose, now + PASSKEY_CHALLENGE_TTL).run();
+}
+
+// Single use: deletes the challenge whether it matches or not
+async function pkConsumeChallenge(env, challenge, purpose) {
+  const now = Math.floor(Date.now() / 1000);
+  const row = await env.DB.prepare(
+    "SELECT * FROM passkey_challenges WHERE challenge = ? AND purpose = ?"
+  ).bind(challenge, purpose).first();
+  if (!row) return null;
+  await env.DB.prepare("DELETE FROM passkey_challenges WHERE challenge = ?").bind(challenge).run();
+  if (row.expires_at < now) return null;
+  return row;
+}
+
+// Checks clientDataJSON; returns the challenge string or throws
+function pkParseClientData(clientDataB64u, expectedType) {
+  const raw = pkB64uToBytes(clientDataB64u);
+  const cd = JSON.parse(new TextDecoder().decode(raw));
+  if (cd.type !== expectedType) throw new Error("wrong type");
+  if (!PASSKEY_ORIGINS.includes(cd.origin)) throw new Error("wrong origin");
+  return { challenge: cd.challenge, raw };
+}
+
+// =====================================================================
+// Router
+// =====================================================================
+async function handlePasskeyRoute(request, env, url) {
+  const path = url.pathname;
+  if (!path.startsWith("/api/passkey/")) return null;
+  if (request.method === "OPTIONS") return null; // let your normal CORS handler answer
+  if (request.method !== "POST") return pkJson({ error: "Method not allowed" }, 405);
+
+  try {
+    if (path === "/api/passkey/register/options") return await pkRegisterOptions(request, env);
+    if (path === "/api/passkey/register/verify") return await pkRegisterVerify(request, env);
+    if (path === "/api/passkey/login/options") return await pkLoginOptions(request, env);
+    if (path === "/api/passkey/login/verify") return await pkLoginVerify(request, env);
+    if (path === "/api/passkey/remove") return await pkRemove(request, env);
+  } catch (e) {
+    return pkJson({ error: "Fingerprint request failed." }, 400);
+  }
+  return pkJson({ error: "Not found" }, 404);
+}
+
+// ---------------------------------------------------------------------
+// Register: step 1 (logged-in staff asks for a challenge)
+// ---------------------------------------------------------------------
+async function pkRegisterOptions(request, env) {
+  const user = await pkAuthenticate(request, env);
+  if (!user) return pkJson({ error: "Please sign in first." }, 401);
+
+  const existing = await env.DB.prepare(
+    "SELECT credential_id FROM passkeys WHERE user_id = ?"
+  ).bind(String(user.id)).all();
+
+  const challenge = pkRandomChallenge();
+  await pkStoreChallenge(env, challenge, user.id, "register");
+
+  return pkJson({
+    publicKey: {
+      rp: { id: PASSKEY_RP_ID, name: PASSKEY_RP_NAME },
+      user: {
+        id: pkBytesToB64u(new TextEncoder().encode(String(user.id))),
+        name: user.email,
+        displayName: user.name || user.email
+      },
+      challenge,
+      pubKeyCredParams: [{ type: "public-key", alg: -7 }, { type: "public-key", alg: -257 }],
+      authenticatorSelection: {
+        authenticatorAttachment: "platform",
+        userVerification: "required",
+        residentKey: "preferred"
+      },
+      excludeCredentials: (existing.results || []).map(r => ({ type: "public-key", id: r.credential_id })),
+      timeout: 60000,
+      attestation: "none"
+    }
+  });
+}
+
+// ---------------------------------------------------------------------
+// Register: step 2 (save the public key)
+// ---------------------------------------------------------------------
+async function pkRegisterVerify(request, env) {
+  const user = await pkAuthenticate(request, env);
+  if (!user) return pkJson({ error: "Please sign in first." }, 401);
+
+  const b = await request.json();
+  if (!b.id || !b.publicKey || !b.clientDataJSON) return pkJson({ error: "Bad request." }, 400);
+  if (b.alg !== -7 && b.alg !== -257) return pkJson({ error: "Unsupported key type." }, 400);
+
+  const cd = pkParseClientData(b.clientDataJSON, "webauthn.create");
+  const ch = await pkConsumeChallenge(env, cd.challenge, "register");
+  if (!ch || String(ch.user_id) !== String(user.id)) {
+    return pkJson({ error: "Setup expired. Please try again." }, 400);
+  }
+
+  // Make sure the key is a valid public key before saving it
+  const spki = pkB64uToBytes(b.publicKey);
+  const algo = b.alg === -7
+    ? { name: "ECDSA", namedCurve: "P-256" }
+    : { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" };
+  await crypto.subtle.importKey("spki", spki, algo, false, ["verify"]);
+
+  await env.DB.prepare(
+    "INSERT INTO passkeys (user_id, credential_id, public_key, alg, counter, label) VALUES (?, ?, ?, ?, 0, ?)"
+  ).bind(String(user.id), b.id, b.publicKey, b.alg, (b.label || "").slice(0, 60)).run();
+
+  return pkJson({ ok: true });
+}
+
+// ---------------------------------------------------------------------
+// Login: step 1 (email -> challenge + allowed credentials)
+// ---------------------------------------------------------------------
+async function pkLoginOptions(request, env) {
+  const b = await request.json();
+  const email = (b.email || "").trim();
+  const generic = { error: "Fingerprint login is not set up for this account. Use your password." };
+  if (!email) return pkJson(generic, 400);
+
+  const user = await pkFindUserByEmail(env, email);
+  if (!user) return pkJson(generic, 400);
+
+  const creds = await env.DB.prepare(
+    "SELECT credential_id FROM passkeys WHERE user_id = ?"
+  ).bind(String(user.id)).all();
+  if (!creds.results || !creds.results.length) return pkJson(generic, 400);
+
+  const challenge = pkRandomChallenge();
+  await pkStoreChallenge(env, challenge, user.id, "login");
+
+  return pkJson({
+    publicKey: {
+      challenge,
+      rpId: PASSKEY_RP_ID,
+      allowCredentials: creds.results.map(r => ({ type: "public-key", id: r.credential_id })),
+      userVerification: "required",
+      timeout: 60000
+    }
+  });
+}
+
+// ---------------------------------------------------------------------
+// Login: step 2 (check the signature, then issue the normal token)
+// ---------------------------------------------------------------------
+async function pkLoginVerify(request, env) {
+  const fail = () => pkJson({ error: "Fingerprint login failed. Use your password." }, 401);
+  const b = await request.json();
+  if (!b.id || !b.clientDataJSON || !b.authenticatorData || !b.signature) return fail();
+
+  const cred = await env.DB.prepare("SELECT * FROM passkeys WHERE credential_id = ?").bind(b.id).first();
+  if (!cred) return fail();
+
+  let cd;
+  try { cd = pkParseClientData(b.clientDataJSON, "webauthn.get"); } catch (e) { return fail(); }
+
+  const ch = await pkConsumeChallenge(env, cd.challenge, "login");
+  if (!ch || String(ch.user_id) !== String(cred.user_id)) return fail();
+
+  const authData = pkB64uToBytes(b.authenticatorData);
+  if (authData.length < 37) return fail();
+
+  // rpIdHash must match our domain
+  const rpHash = await pkSha256(new TextEncoder().encode(PASSKEY_RP_ID));
+  if (!pkEqual(authData.slice(0, 32), rpHash)) return fail();
+
+  const flags = authData[32];
+  if (!(flags & 0x01)) return fail(); // user present
+  if (!(flags & 0x04)) return fail(); // user verified (fingerprint/face/PIN)
+
+  const counter = ((authData[33] << 24) | (authData[34] << 16) | (authData[35] << 8) | authData[36]) >>> 0;
+  if (counter !== 0 || cred.counter !== 0) {
+    if (counter <= cred.counter) return fail(); // cloned/replayed authenticator
+  }
+
+  // signature is over authData || sha256(clientDataJSON)
+  const cdHash = await pkSha256(cd.raw);
+  const signedData = new Uint8Array(authData.length + cdHash.length);
+  signedData.set(authData, 0);
+  signedData.set(cdHash, authData.length);
+
+  const spki = pkB64uToBytes(cred.public_key);
+  const sig = pkB64uToBytes(b.signature);
+  let ok = false;
+  try {
+    if (cred.alg === -7) {
+      const key = await crypto.subtle.importKey("spki", spki, { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"]);
+      ok = await crypto.subtle.verify({ name: "ECDSA", hash: "SHA-256" }, key, pkDerToRaw(sig), signedData);
+    } else if (cred.alg === -257) {
+      const key = await crypto.subtle.importKey("spki", spki, { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["verify"]);
+      ok = await crypto.subtle.verify("RSASSA-PKCS1-v1_5", key, sig, signedData);
+    }
+  } catch (e) { ok = false; }
+  if (!ok) return fail();
+
+  await env.DB.prepare("UPDATE passkeys SET counter = ? WHERE id = ?").bind(counter, cred.id).run();
+
+  const user = await pkFindUserById(env, cred.user_id);
+  if (!user) return fail();
+
+  const result = await pkBuildLoginResult(env, user);
+  if (result.error) return pkJson({ error: result.error }, result.status || 403);
+  return pkJson(result.body);
+}
+
+// ---------------------------------------------------------------------
+// Remove: a signed-in staff removes their own key; an admin may pass
+// { userId } to clear a lost phone for someone else.
+// ---------------------------------------------------------------------
+async function pkRemove(request, env) {
+  const me = await pkAuthenticate(request, env);
+  if (!me) return pkJson({ error: "Please sign in first." }, 401);
+  const b = await request.json().catch(() => ({}));
+  let targetId = String(me.id);
+  if (b.userId && String(b.userId) !== String(me.id)) {
+    if (me.role !== "general_admin") return pkJson({ error: "Not allowed." }, 403);
+    targetId = String(b.userId);
+  }
+  await env.DB.prepare("DELETE FROM passkeys WHERE user_id = ?").bind(targetId).run();
+  return pkJson({ ok: true });
+}
+
+// =====================================================================
 // SECTION 8: Entry point — routes across all sections above
 // =====================================================================
 const modules = [
+  handlePasskeyRoute,
   handleAuthRoutes,
   handleStudentAuthRoutes,
   handleAttendanceRoutes,
