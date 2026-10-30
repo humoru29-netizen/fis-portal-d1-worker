@@ -1494,6 +1494,20 @@ function cleanHouse(v) {
 }
 
 /**
+ * Student post of responsibility (Head Boy, Senior Prefect, Class Captain ...). Free text, shown on the
+ * QR verification page. Returns null for "no post", the cleaned text, or false when it is not usable.
+ *
+ * Migration (run once in the D1 console, before deploying):
+ *   ALTER TABLE students ADD COLUMN post TEXT;
+ */
+function cleanPost(v) {
+  if (v === null || v === undefined) return null;
+  const t = String(v).replace(/[\u0000-\u001f]/g, " ").replace(/\s+/g, " ").trim();
+  if (!t) return null;
+  return t.length <= 60 ? t : false;
+}
+
+/**
  * Student ID card serial number, issue date and expiry date.
  * Serial = FIS + year + 4-digit number for secondary, FISP + year + 4-digit number for
  * primary and nursery (two separate series, each restarting at 0001 every year).
@@ -1546,7 +1560,7 @@ async function handleRosterRoutes(request, env, url) {
     }
     const row = await env.DB
       .prepare(
-        `SELECT s.name, s.level, s.status, c.name AS class_name
+        `SELECT s.name, s.level, s.status, s.post, c.name AS class_name
          FROM students s LEFT JOIN classes c ON c.id = s.class_id
          WHERE s.verify_code = ?`
       )
@@ -1563,7 +1577,8 @@ async function handleRosterRoutes(request, env, url) {
       school: "Faith International School, Itobe",
       name: row.name,
       className: row.class_name || "",
-      level: row.level
+      level: row.level,
+      post: row.post || ""
     });
   }
 
@@ -1604,6 +1619,17 @@ async function handleRosterRoutes(request, env, url) {
     }
     const subjects = Object.keys(bySubject).map((s) => ({ subject: s, classes: bySubject[s] }));
 
+    // Form master: the class is looked up live, so a renamed class stays correct. Skipped quietly
+    // if the form_class_id column has not been added yet.
+    let formClass = "";
+    try {
+      const fc = await env.DB
+        .prepare("SELECT c.name FROM users u JOIN classes c ON c.id = u.form_class_id WHERE u.id = ?")
+        .bind(row.id)
+        .first();
+      if (fc && fc.name) formClass = fc.name;
+    } catch (e) {}
+
     return json({
       valid: true,
       school: "Faith International School, Itobe",
@@ -1612,6 +1638,7 @@ async function handleRosterRoutes(request, env, url) {
       jobTitle: row.job_title || (row.role === "teacher" ? "Teacher" : ""),
       level: row.level || "",
       phone: row.phone || "",
+      formClass,
       subjects
     });
   }
@@ -1853,12 +1880,14 @@ async function handleRosterRoutes(request, env, url) {
     const sessionCtx = await getSession(request, env);
     if (!isAdminSession(sessionCtx)) return json({ error: "Not authorised." }, 403);
 
-    const { name, classId, level, sessionJoined, guardianName, guardianPhone, gender, house } = await request.json();
+    const { name, classId, level, sessionJoined, guardianName, guardianPhone, gender, house, post } = await request.json();
     if (!name || !classId || !level) {
       return json({ error: "name, classId, and level are required." }, 400);
     }
     const houseKey = cleanHouse(house);
     if (houseKey === false) return json({ error: "That house is not valid." }, 400);
+    const postVal = cleanPost(post);
+    if (postVal === false) return json({ error: "The post is too long (60 characters at most)." }, 400);
     const restriction = adminLevelRestriction(sessionCtx);
     if (restriction && level !== restriction) {
       return json({ error: `As a ${restriction} admin, you can only add ${restriction} students.` }, 403);
@@ -1887,6 +1916,7 @@ async function handleRosterRoutes(request, env, url) {
       .run();
 
     if (houseKey) await env.DB.prepare("UPDATE students SET house = ? WHERE id = ?").bind(houseKey, id).run();
+    if (postVal) await env.DB.prepare("UPDATE students SET post = ? WHERE id = ?").bind(postVal, id).run();
 
     return json({ message: "Student added.", id, admissionNo });
   }
@@ -2465,13 +2495,16 @@ async function handleRosterRoutes(request, env, url) {
       return json({ error: "Not authorised for this student." }, 403);
     }
 
-    const { name, classId, sessionJoined, guardianName, guardianPhone, dob, gender, house } = await request.json();
+    const { name, classId, sessionJoined, guardianName, guardianPhone, dob, gender, house, post } = await request.json();
     if (!name || !classId) {
       return json({ error: "name and classId are required." }, 400);
     }
     // house: leave unchanged when the field is not sent; "" clears it
     const houseKey = house === undefined ? undefined : cleanHouse(house);
     if (houseKey === false) return json({ error: "That house is not valid." }, 400);
+    // post: leave unchanged when the field is not sent; "" clears it
+    const postVal = post === undefined ? undefined : cleanPost(post);
+    if (postVal === false) return json({ error: "The post is too long (60 characters at most)." }, 400);
 
     // If moving the student to a different class, that class must be within
     // the admin's level restriction too (a level admin can't move a student
@@ -2494,6 +2527,9 @@ async function handleRosterRoutes(request, env, url) {
 
     if (houseKey !== undefined) {
       await env.DB.prepare("UPDATE students SET house = ? WHERE id = ?").bind(houseKey, studentId).run();
+    }
+    if (postVal !== undefined) {
+      await env.DB.prepare("UPDATE students SET post = ? WHERE id = ?").bind(postVal, studentId).run();
     }
 
     return json({ message: "Student updated." });
@@ -2855,6 +2891,7 @@ async function handleManageAccountsRoutes(request, env, url) {
 
     const baseCols = "id, name, email, phone, dob, role, level, status, created_at, approved_by, approved_at";
     const tiers = [
+      baseCols + ", photo_url, staff_no, signature_url, job_title, form_class_id",
       baseCols + ", photo_url, staff_no, signature_url, job_title",
       baseCols + ", photo_url, staff_no, signature_url",
       baseCols + ", photo_url, staff_no", // signature_url column not added yet (migration-teacher-signature.sql)
@@ -2941,6 +2978,34 @@ async function handleManageAccountsRoutes(request, env, url) {
       return json({ error: "Could not save the title.", detail: String(e && e.message || e) }, 500);
     }
     return json({ message: title ? "Title saved." : "Title cleared.", jobTitle: title });
+  }
+
+  // ---------------- SET THE CLASS A TEACHER IS FORM MASTER OF (shown on the teacher's QR page) ----------------
+  // Migration (run once in the D1 console, before deploying):
+  //   ALTER TABLE users ADD COLUMN form_class_id TEXT;
+  const formClassMatch = pathname.match(/^\/api\/staff\/([^/]+)\/form-class$/);
+  if (formClassMatch && request.method === "PATCH") {
+    const sessionCtx = await getSession(request, env);
+    if (!isGeneralAdmin(sessionCtx)) return json({ error: "Not authorised. Only the General Admin can manage accounts." }, 403);
+
+    const staffId = formClassMatch[1];
+    let body;
+    try { body = await request.json(); } catch (e) { return json({ error: "Invalid request." }, 400); }
+    const classId = body.classId ? String(body.classId) : null;
+
+    const target = await env.DB.prepare("SELECT id FROM users WHERE id = ?").bind(staffId).first();
+    if (!target) return json({ error: "Account not found." }, 404);
+    if (classId) {
+      const cls = await env.DB.prepare("SELECT id FROM classes WHERE id = ?").bind(classId).first();
+      if (!cls) return json({ error: "Class not found." }, 404);
+    }
+
+    try {
+      await env.DB.prepare("UPDATE users SET form_class_id = ? WHERE id = ?").bind(classId, staffId).run();
+    } catch (e) {
+      return json({ error: "Could not save the form master class.", detail: String(e && e.message || e) }, 500);
+    }
+    return json({ message: classId ? "Form master saved." : "Form master cleared." });
   }
 
   // ---------------- SET A STAFF MEMBER'S SIGNATURE IMAGE (printed on the teacher ID card) ----------------
@@ -3799,7 +3864,6 @@ async function handleReportCardRoutes(request, env, url) {
  *   POST   /api/cbt/tests/:id/questions          (teaching staff) add a question
  *   GET    /api/cbt/tests/:id/questions          (teaching staff) list questions (includes correct answers)
  *   DELETE /api/cbt/tests/:id/questions/:qId     (teaching staff) remove a question
- *   POST   /api/cbt/question-bank/bulk-delete    (teaching staff) { ids:[...] } or { deleteAll:true, classId, subjectId, term }
  *   GET    /api/cbt/tests/:id/results            (teaching staff) list of student scores
  *
  * Routes (student — sees only their own class's published tests):
@@ -4097,173 +4161,6 @@ async function handleCbtRoutes(request, env, url) {
     return json({ questions: results });
   }
 
-  // ---------------- QUESTION BANK: BULK DELETE ----------------
-  // POST /api/cbt/question-bank/bulk-delete
-  //   { ids: ["id1", "id2", ...] }                      -> delete those questions
-  //   { deleteAll: true, classId, subjectId, term }     -> delete every question in that class/subject/term
-  if (pathname === "/api/cbt/question-bank/bulk-delete" && request.method === "POST") {
-    const sessionCtx = await getSession(request, env);
-    if (!isTeachingStaff(sessionCtx)) return json({ error: "Not authorised." }, 403);
-
-    let body;
-    try { body = await request.json(); } catch (e) { return json({ error: "Invalid request body." }, 400); }
-    const { ids, deleteAll, classId, subjectId, term } = body || {};
-    const restriction = adminLevelRestriction(sessionCtx);
-
-    // Helper: confirm a class is within this admin's level restriction
-    const classAllowed = async (cid) => {
-      if (!restriction) return true;
-      const cls = await env.DB.prepare("SELECT level FROM classes WHERE id = ?").bind(cid).first();
-      return !!cls && cls.level === restriction;
-    };
-
-    // ---- Mode 1: delete everything in one class + subject + term ----
-    if (deleteAll === true) {
-      if (!classId || !subjectId || !term) {
-        return json({ error: "classId, subjectId, and term are required to delete all." }, 400);
-      }
-      if (!(await classAllowed(classId))) return json({ error: "Not authorised for this class." }, 403);
-
-      const result = await env.DB
-        .prepare("DELETE FROM cbt_question_bank WHERE class_id = ? AND subject_id = ? AND term = ?")
-        .bind(classId, subjectId, term)
-        .run();
-      const deleted = (result && result.meta && result.meta.changes) || 0;
-      return json({ message: deleted + " question(s) removed from the bank.", deleted });
-    }
-
-    // ---- Mode 2: delete a specific list of ids ----
-    if (!Array.isArray(ids) || !ids.length) {
-      return json({ error: "ids must be a non-empty array." }, 400);
-    }
-    if (ids.length > 1000) {
-      return json({ error: "Too many questions at once. Maximum is 1000 per request." }, 400);
-    }
-    const cleanIds = [...new Set(ids.filter(x => typeof x === "string" && x))];
-    if (!cleanIds.length) return json({ error: "No valid ids supplied." }, 400);
-
-    // D1 limits bound parameters per query, so work in small chunks
-    const CHUNK = 50;
-    const chunks = [];
-    for (let i = 0; i < cleanIds.length; i += CHUNK) chunks.push(cleanIds.slice(i, i + CHUNK));
-
-    // Level-restricted admins may only delete questions from classes at their level
-    if (restriction) {
-      const classCache = {};
-      for (const chunk of chunks) {
-        const ph = chunk.map(() => "?").join(",");
-        const { results } = await env.DB
-          .prepare("SELECT DISTINCT class_id FROM cbt_question_bank WHERE id IN (" + ph + ")")
-          .bind(...chunk)
-          .all();
-        for (const r of results) {
-          if (!(r.class_id in classCache)) classCache[r.class_id] = await classAllowed(r.class_id);
-          if (!classCache[r.class_id]) {
-            return json({ error: "Not authorised: some selected questions belong to a class outside your level." }, 403);
-          }
-        }
-      }
-    }
-
-    let deleted = 0;
-    for (const chunk of chunks) {
-      const ph = chunk.map(() => "?").join(",");
-      const result = await env.DB
-        .prepare("DELETE FROM cbt_question_bank WHERE id IN (" + ph + ")")
-        .bind(...chunk)
-        .run();
-      deleted += (result && result.meta && result.meta.changes) || 0;
-    }
-    return json({ message: deleted + " question(s) removed from the bank.", deleted });
-  }
-
-  // ---------------- QUESTION BANK: COPY TO ONE OR MORE CLASSES ----------------
-  // POST /api/cbt/question-bank/copy
-  //   { fromClassId, toClassIds: [...], subjectId, term, ids?: [...] }  (omit ids to copy the whole class/subject/term)
-  //   (a single toClassId is still accepted)
-  if (pathname === "/api/cbt/question-bank/copy" && request.method === "POST") {
-    const sessionCtx = await getSession(request, env);
-    if (!isTeachingStaff(sessionCtx)) return json({ error: "Not authorised." }, 403);
-
-    let body;
-    try { body = await request.json(); } catch (e) { return json({ error: "Invalid request body." }, 400); }
-    const { fromClassId, toClassId, toClassIds, subjectId, term, ids } = body || {};
-    if (!fromClassId || !subjectId || !term) {
-      return json({ error: "fromClassId, subjectId, and term are required." }, 400);
-    }
-    let targets = Array.isArray(toClassIds) ? toClassIds : (toClassId ? [toClassId] : []);
-    targets = [...new Set(targets.filter(t => typeof t === "string" && t && t !== fromClassId))];
-    if (!targets.length) return json({ error: "Choose at least one different class to copy to." }, 400);
-    if (targets.length > 30) return json({ error: "Too many classes at once." }, 400);
-
-    const restriction = adminLevelRestriction(sessionCtx);
-    const levelOk = async (cid) => {
-      if (!restriction) return true;
-      const cls = await env.DB.prepare("SELECT level FROM classes WHERE id = ?").bind(cid).first();
-      return !!cls && cls.level === restriction;
-    };
-    if (!(await levelOk(fromClassId))) return json({ error: "Not authorised for this class." }, 403);
-    for (const t of targets) {
-      if (!(await levelOk(t))) return json({ error: "Not authorised for one of the selected classes." }, 403);
-    }
-
-    const { results: source } = await env.DB
-      .prepare("SELECT * FROM cbt_question_bank WHERE class_id = ? AND subject_id = ? AND term = ?")
-      .bind(fromClassId, subjectId, term).all();
-    const idSet = Array.isArray(ids) && ids.length ? new Set(ids) : null;
-    const toCopy = idSet ? source.filter(q => idSet.has(q.id)) : source;
-    if (!toCopy.length) return json({ error: "No questions to copy." }, 400);
-
-    let totalCopied = 0, totalSkipped = 0;
-    const perClass = [];
-
-    for (const target of targets) {
-      const cls = await env.DB.prepare("SELECT name FROM classes WHERE id = ?").bind(target).first();
-      const name = (cls && cls.name) || target;
-
-      const hasSubject = await env.DB
-        .prepare("SELECT 1 FROM class_subjects WHERE class_id = ? AND subject_id = ?")
-        .bind(target, subjectId).first();
-      if (!hasSubject) {
-        perClass.push({ classId: target, name, copied: 0, skipped: 0, error: "Subject not assigned to this class" });
-        continue;
-      }
-
-      // Skip questions the target already has (same text, type and answer)
-      const { results: existing } = await env.DB
-        .prepare("SELECT question_text, type, correct_option FROM cbt_question_bank WHERE class_id = ? AND subject_id = ? AND term = ?")
-        .bind(target, subjectId, term).all();
-      const seen = new Set(existing.map(q => q.question_text + "||" + q.type + "||" + q.correct_option));
-
-      const stmts = [];
-      let skipped = 0;
-      for (const q of toCopy) {
-        const key = q.question_text + "||" + q.type + "||" + q.correct_option;
-        if (seen.has(key)) { skipped++; continue; }
-        seen.add(key);
-        stmts.push(
-          env.DB.prepare(
-            `INSERT INTO cbt_question_bank (id, class_id, subject_id, term, question_text, type, option_a, option_b, option_c, option_d, correct_option, points, created_by, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))`
-          ).bind(uuid(), target, subjectId, term, q.question_text, q.type, q.option_a, q.option_b, q.option_c, q.option_d, q.correct_option, q.points, sessionCtx.id)
-        );
-      }
-      for (let i = 0; i < stmts.length; i += 50) await env.DB.batch(stmts.slice(i, i + 50));
-
-      totalCopied += stmts.length;
-      totalSkipped += skipped;
-      perClass.push({ classId: target, name, copied: stmts.length, skipped });
-    }
-
-    const parts = perClass.map(p => p.error
-      ? p.name + ": not copied (" + p.error + ")"
-      : p.name + ": " + p.copied + " copied" + (p.skipped ? ", " + p.skipped + " skipped" : ""));
-    return json({
-      message: parts.join(" · "),
-      copied: totalCopied, skipped: totalSkipped, results: perClass
-    });
-  }
-
   // ---------------- QUESTION BANK: DELETE ----------------
   const bankDeleteMatch = pathname.match(/^\/api\/cbt\/question-bank\/([^/]+)$/);
   if (bankDeleteMatch && request.method === "DELETE") {
@@ -4281,6 +4178,39 @@ async function handleCbtRoutes(request, env, url) {
 
     await env.DB.prepare("DELETE FROM cbt_question_bank WHERE id = ?").bind(bankDeleteMatch[1]).run();
     return json({ message: "Removed from question bank." });
+  }
+
+  // ---------------- QUESTION BANK: BULK DELETE ----------------
+  if (pathname === "/api/cbt/question-bank/delete-many" && request.method === "POST") {
+    const sessionCtx = await getSession(request, env);
+    if (!isTeachingStaff(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    let body;
+    try { body = await request.json(); } catch (e) { return json({ error: "Invalid request." }, 400); }
+    const ids = Array.isArray(body.ids)
+      ? [...new Set(body.ids.filter(x => typeof x === "string" && x))]
+      : [];
+    if (!ids.length) return json({ error: "Select at least one question." }, 400);
+    if (ids.length > 500) return json({ error: "Too many questions at once. Delete 500 or fewer at a time." }, 400);
+
+    const restriction = adminLevelRestriction(sessionCtx);
+    let deleted = 0;
+    for (let i = 0; i < ids.length; i += 50) {
+      const chunk = ids.slice(i, i + 50);
+      const ph = chunk.map(() => "?").join(",");
+      let res;
+      if (restriction) {
+        res = await env.DB
+          .prepare(`DELETE FROM cbt_question_bank WHERE id IN (${ph}) AND class_id IN (SELECT id FROM classes WHERE level = ?)`)
+          .bind(...chunk, restriction).run();
+      } else {
+        res = await env.DB
+          .prepare(`DELETE FROM cbt_question_bank WHERE id IN (${ph})`)
+          .bind(...chunk).run();
+      }
+      deleted += (res.meta && res.meta.changes) || 0;
+    }
+    return json({ message: deleted + " question(s) removed from the bank.", deleted });
   }
 
   // ---------------- ADD QUESTIONS TO A TEST FROM THE BANK ----------------
