@@ -3799,6 +3799,7 @@ async function handleReportCardRoutes(request, env, url) {
  *   POST   /api/cbt/tests/:id/questions          (teaching staff) add a question
  *   GET    /api/cbt/tests/:id/questions          (teaching staff) list questions (includes correct answers)
  *   DELETE /api/cbt/tests/:id/questions/:qId     (teaching staff) remove a question
+ *   POST   /api/cbt/question-bank/bulk-delete    (teaching staff) { ids:[...] } or { deleteAll:true, classId, subjectId, term }
  *   GET    /api/cbt/tests/:id/results            (teaching staff) list of student scores
  *
  * Routes (student — sees only their own class's published tests):
@@ -4094,6 +4095,86 @@ async function handleCbtRoutes(request, env, url) {
       .all();
 
     return json({ questions: results });
+  }
+
+  // ---------------- QUESTION BANK: BULK DELETE ----------------
+  // POST /api/cbt/question-bank/bulk-delete
+  //   { ids: ["id1", "id2", ...] }                      -> delete those questions
+  //   { deleteAll: true, classId, subjectId, term }     -> delete every question in that class/subject/term
+  if (pathname === "/api/cbt/question-bank/bulk-delete" && request.method === "POST") {
+    const sessionCtx = await getSession(request, env);
+    if (!isTeachingStaff(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    let body;
+    try { body = await request.json(); } catch (e) { return json({ error: "Invalid request body." }, 400); }
+    const { ids, deleteAll, classId, subjectId, term } = body || {};
+    const restriction = adminLevelRestriction(sessionCtx);
+
+    // Helper: confirm a class is within this admin's level restriction
+    const classAllowed = async (cid) => {
+      if (!restriction) return true;
+      const cls = await env.DB.prepare("SELECT level FROM classes WHERE id = ?").bind(cid).first();
+      return !!cls && cls.level === restriction;
+    };
+
+    // ---- Mode 1: delete everything in one class + subject + term ----
+    if (deleteAll === true) {
+      if (!classId || !subjectId || !term) {
+        return json({ error: "classId, subjectId, and term are required to delete all." }, 400);
+      }
+      if (!(await classAllowed(classId))) return json({ error: "Not authorised for this class." }, 403);
+
+      const result = await env.DB
+        .prepare("DELETE FROM cbt_question_bank WHERE class_id = ? AND subject_id = ? AND term = ?")
+        .bind(classId, subjectId, term)
+        .run();
+      const deleted = (result && result.meta && result.meta.changes) || 0;
+      return json({ message: deleted + " question(s) removed from the bank.", deleted });
+    }
+
+    // ---- Mode 2: delete a specific list of ids ----
+    if (!Array.isArray(ids) || !ids.length) {
+      return json({ error: "ids must be a non-empty array." }, 400);
+    }
+    if (ids.length > 1000) {
+      return json({ error: "Too many questions at once. Maximum is 1000 per request." }, 400);
+    }
+    const cleanIds = [...new Set(ids.filter(x => typeof x === "string" && x))];
+    if (!cleanIds.length) return json({ error: "No valid ids supplied." }, 400);
+
+    // D1 limits bound parameters per query, so work in small chunks
+    const CHUNK = 50;
+    const chunks = [];
+    for (let i = 0; i < cleanIds.length; i += CHUNK) chunks.push(cleanIds.slice(i, i + CHUNK));
+
+    // Level-restricted admins may only delete questions from classes at their level
+    if (restriction) {
+      const classCache = {};
+      for (const chunk of chunks) {
+        const ph = chunk.map(() => "?").join(",");
+        const { results } = await env.DB
+          .prepare("SELECT DISTINCT class_id FROM cbt_question_bank WHERE id IN (" + ph + ")")
+          .bind(...chunk)
+          .all();
+        for (const r of results) {
+          if (!(r.class_id in classCache)) classCache[r.class_id] = await classAllowed(r.class_id);
+          if (!classCache[r.class_id]) {
+            return json({ error: "Not authorised: some selected questions belong to a class outside your level." }, 403);
+          }
+        }
+      }
+    }
+
+    let deleted = 0;
+    for (const chunk of chunks) {
+      const ph = chunk.map(() => "?").join(",");
+      const result = await env.DB
+        .prepare("DELETE FROM cbt_question_bank WHERE id IN (" + ph + ")")
+        .bind(...chunk)
+        .run();
+      deleted += (result && result.meta && result.meta.changes) || 0;
+    }
+    return json({ message: deleted + " question(s) removed from the bank.", deleted });
   }
 
   // ---------------- QUESTION BANK: DELETE ----------------
