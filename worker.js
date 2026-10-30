@@ -1623,11 +1623,16 @@ async function handleRosterRoutes(request, env, url) {
     // if the form_class_id column has not been added yet.
     let formClass = "";
     try {
-      const fc = await env.DB
-        .prepare("SELECT c.name FROM users u JOIN classes c ON c.id = u.form_class_id WHERE u.id = ?")
-        .bind(row.id)
-        .first();
-      if (fc && fc.name) formClass = fc.name;
+      const fcRow = await env.DB.prepare("SELECT form_class_id FROM users WHERE id = ?").bind(row.id).first();
+      const fcIds = String((fcRow && fcRow.form_class_id) || "").split(",").map((x) => x.trim()).filter(Boolean).slice(0, 20);
+      if (fcIds.length) {
+        const marks = fcIds.map(() => "?").join(",");
+        const { results: fcNames } = await env.DB
+          .prepare(`SELECT name FROM classes WHERE id IN (${marks}) ORDER BY sort_order`)
+          .bind(...fcIds)
+          .all();
+        formClass = fcNames.map((r) => r.name).join(", ");
+      }
     } catch (e) {}
 
     return json({
@@ -2980,7 +2985,7 @@ async function handleManageAccountsRoutes(request, env, url) {
     return json({ message: title ? "Title saved." : "Title cleared.", jobTitle: title });
   }
 
-  // ---------------- SET THE CLASS A TEACHER IS FORM MASTER OF (shown on the teacher's QR page) ----------------
+  // ---------------- SET THE CLASS(ES) A TEACHER IS FORM MASTER OF (shown on the teacher's QR page) ----------------
   // Migration (run once in the D1 console, before deploying):
   //   ALTER TABLE users ADD COLUMN form_class_id TEXT;
   const formClassMatch = pathname.match(/^\/api\/staff\/([^/]+)\/form-class$/);
@@ -2991,21 +2996,26 @@ async function handleManageAccountsRoutes(request, env, url) {
     const staffId = formClassMatch[1];
     let body;
     try { body = await request.json(); } catch (e) { return json({ error: "Invalid request." }, 400); }
-    const classId = body.classId ? String(body.classId) : null;
+    // One or several classes. Stored in form_class_id as comma-separated class ids (ids never contain commas).
+    let classIds = Array.isArray(body.classIds) ? body.classIds : (body.classId ? [body.classId] : []);
+    classIds = [...new Set(classIds.map((x) => String(x).trim()).filter(Boolean))];
+    if (classIds.length > 20) return json({ error: "Too many classes selected." }, 400);
 
     const target = await env.DB.prepare("SELECT id FROM users WHERE id = ?").bind(staffId).first();
     if (!target) return json({ error: "Account not found." }, 404);
-    if (classId) {
-      const cls = await env.DB.prepare("SELECT id FROM classes WHERE id = ?").bind(classId).first();
-      if (!cls) return json({ error: "Class not found." }, 404);
+    if (classIds.length) {
+      const marks = classIds.map(() => "?").join(",");
+      const { results: found } = await env.DB.prepare(`SELECT id FROM classes WHERE id IN (${marks})`).bind(...classIds).all();
+      if (found.length !== classIds.length) return json({ error: "One of the selected classes was not found." }, 404);
     }
+    const stored = classIds.length ? classIds.join(",") : null;
 
     try {
-      await env.DB.prepare("UPDATE users SET form_class_id = ? WHERE id = ?").bind(classId, staffId).run();
+      await env.DB.prepare("UPDATE users SET form_class_id = ? WHERE id = ?").bind(stored, staffId).run();
     } catch (e) {
-      return json({ error: "Could not save the form master class.", detail: String(e && e.message || e) }, 500);
+      return json({ error: "Could not save the form master classes.", detail: String(e && e.message || e) }, 500);
     }
-    return json({ message: classId ? "Form master saved." : "Form master cleared." });
+    return json({ message: classIds.length ? "Form master saved (" + classIds.length + " class" + (classIds.length > 1 ? "es" : "") + ")." : "Form master cleared." });
   }
 
   // ---------------- SET A STAFF MEMBER'S SIGNATURE IMAGE (printed on the teacher ID card) ----------------
