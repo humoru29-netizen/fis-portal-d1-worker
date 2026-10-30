@@ -4177,6 +4177,93 @@ async function handleCbtRoutes(request, env, url) {
     return json({ message: deleted + " question(s) removed from the bank.", deleted });
   }
 
+  // ---------------- QUESTION BANK: COPY TO ONE OR MORE CLASSES ----------------
+  // POST /api/cbt/question-bank/copy
+  //   { fromClassId, toClassIds: [...], subjectId, term, ids?: [...] }  (omit ids to copy the whole class/subject/term)
+  //   (a single toClassId is still accepted)
+  if (pathname === "/api/cbt/question-bank/copy" && request.method === "POST") {
+    const sessionCtx = await getSession(request, env);
+    if (!isTeachingStaff(sessionCtx)) return json({ error: "Not authorised." }, 403);
+
+    let body;
+    try { body = await request.json(); } catch (e) { return json({ error: "Invalid request body." }, 400); }
+    const { fromClassId, toClassId, toClassIds, subjectId, term, ids } = body || {};
+    if (!fromClassId || !subjectId || !term) {
+      return json({ error: "fromClassId, subjectId, and term are required." }, 400);
+    }
+    let targets = Array.isArray(toClassIds) ? toClassIds : (toClassId ? [toClassId] : []);
+    targets = [...new Set(targets.filter(t => typeof t === "string" && t && t !== fromClassId))];
+    if (!targets.length) return json({ error: "Choose at least one different class to copy to." }, 400);
+    if (targets.length > 30) return json({ error: "Too many classes at once." }, 400);
+
+    const restriction = adminLevelRestriction(sessionCtx);
+    const levelOk = async (cid) => {
+      if (!restriction) return true;
+      const cls = await env.DB.prepare("SELECT level FROM classes WHERE id = ?").bind(cid).first();
+      return !!cls && cls.level === restriction;
+    };
+    if (!(await levelOk(fromClassId))) return json({ error: "Not authorised for this class." }, 403);
+    for (const t of targets) {
+      if (!(await levelOk(t))) return json({ error: "Not authorised for one of the selected classes." }, 403);
+    }
+
+    const { results: source } = await env.DB
+      .prepare("SELECT * FROM cbt_question_bank WHERE class_id = ? AND subject_id = ? AND term = ?")
+      .bind(fromClassId, subjectId, term).all();
+    const idSet = Array.isArray(ids) && ids.length ? new Set(ids) : null;
+    const toCopy = idSet ? source.filter(q => idSet.has(q.id)) : source;
+    if (!toCopy.length) return json({ error: "No questions to copy." }, 400);
+
+    let totalCopied = 0, totalSkipped = 0;
+    const perClass = [];
+
+    for (const target of targets) {
+      const cls = await env.DB.prepare("SELECT name FROM classes WHERE id = ?").bind(target).first();
+      const name = (cls && cls.name) || target;
+
+      const hasSubject = await env.DB
+        .prepare("SELECT 1 FROM class_subjects WHERE class_id = ? AND subject_id = ?")
+        .bind(target, subjectId).first();
+      if (!hasSubject) {
+        perClass.push({ classId: target, name, copied: 0, skipped: 0, error: "Subject not assigned to this class" });
+        continue;
+      }
+
+      // Skip questions the target already has (same text, type and answer)
+      const { results: existing } = await env.DB
+        .prepare("SELECT question_text, type, correct_option FROM cbt_question_bank WHERE class_id = ? AND subject_id = ? AND term = ?")
+        .bind(target, subjectId, term).all();
+      const seen = new Set(existing.map(q => q.question_text + "||" + q.type + "||" + q.correct_option));
+
+      const stmts = [];
+      let skipped = 0;
+      for (const q of toCopy) {
+        const key = q.question_text + "||" + q.type + "||" + q.correct_option;
+        if (seen.has(key)) { skipped++; continue; }
+        seen.add(key);
+        stmts.push(
+          env.DB.prepare(
+            `INSERT INTO cbt_question_bank (id, class_id, subject_id, term, question_text, type, option_a, option_b, option_c, option_d, correct_option, points, created_by, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))`
+          ).bind(uuid(), target, subjectId, term, q.question_text, q.type, q.option_a, q.option_b, q.option_c, q.option_d, q.correct_option, q.points, sessionCtx.id)
+        );
+      }
+      for (let i = 0; i < stmts.length; i += 50) await env.DB.batch(stmts.slice(i, i + 50));
+
+      totalCopied += stmts.length;
+      totalSkipped += skipped;
+      perClass.push({ classId: target, name, copied: stmts.length, skipped });
+    }
+
+    const parts = perClass.map(p => p.error
+      ? p.name + ": not copied (" + p.error + ")"
+      : p.name + ": " + p.copied + " copied" + (p.skipped ? ", " + p.skipped + " skipped" : ""));
+    return json({
+      message: parts.join(" · "),
+      copied: totalCopied, skipped: totalSkipped, results: perClass
+    });
+  }
+
   // ---------------- QUESTION BANK: DELETE ----------------
   const bankDeleteMatch = pathname.match(/^\/api\/cbt\/question-bank\/([^/]+)$/);
   if (bankDeleteMatch && request.method === "DELETE") {
